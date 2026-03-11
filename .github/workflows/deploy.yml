@@ -1,0 +1,68 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    env:
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT != '' && vars.DEPLOY_PORT || '22' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH != '' && vars.DEPLOY_PATH || '/opt/telegram-content-agent' }}
+      DEPLOY_ENV_FILE: ${{ vars.DEPLOY_ENV_FILE != '' && vars.DEPLOY_ENV_FILE || '/opt/telegram-content-agent/.env.production' }}
+      DEPLOY_SERVICE_NAME: ${{ vars.DEPLOY_SERVICE_NAME != '' && vars.DEPLOY_SERVICE_NAME || 'telegram-content-agent' }}
+      DEPLOY_APP_HOST: ${{ vars.DEPLOY_APP_HOST != '' && vars.DEPLOY_APP_HOST || '127.0.0.1' }}
+      DEPLOY_APP_PORT: ${{ vars.DEPLOY_APP_PORT != '' && vars.DEPLOY_APP_PORT || '8000' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Ensure remote directory exists
+        run: |
+          ssh -p "$DEPLOY_PORT" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "mkdir -p '$DEPLOY_PATH'"
+
+      - name: Sync project to server
+        run: |
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.venv/' \
+            --exclude '__pycache__/' \
+            --exclude '*.pyc' \
+            ./ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$DEPLOY_PATH/"
+
+      - name: Run remote deployment
+        run: |
+          ssh -p "$DEPLOY_PORT" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "APP_DIR='$DEPLOY_PATH' \
+             APP_USER='${{ secrets.DEPLOY_USER }}' \
+             ENV_FILE='$DEPLOY_ENV_FILE' \
+             SERVICE_NAME='$DEPLOY_SERVICE_NAME' \
+             APP_HOST='$DEPLOY_APP_HOST' \
+             APP_PORT='$DEPLOY_APP_PORT' \
+             bash '$DEPLOY_PATH/scripts/deploy_remote.sh'"
