@@ -1,7 +1,7 @@
 name: Deploy
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   workflow_run:
     workflows:
       - CI
@@ -19,18 +19,18 @@ jobs:
       group: production-deploy
       cancel-in-progress: false
     env:
-      DEPLOY_PORT: ${{ vars.DEPLOY_PORT != '' && vars.DEPLOY_PORT || '22' }}
-      DEPLOY_PATH: ${{ vars.DEPLOY_PATH != '' && vars.DEPLOY_PATH || '/opt/telegram-content-agent' }}
-      DEPLOY_ENV_FILE: ${{ vars.DEPLOY_ENV_FILE != '' && vars.DEPLOY_ENV_FILE || '/opt/telegram-content-agent/.env.production' }}
-      DEPLOY_SERVICE_NAME: ${{ vars.DEPLOY_SERVICE_NAME != '' && vars.DEPLOY_SERVICE_NAME || 'telegram-content-agent' }}
-      DEPLOY_APP_HOST: ${{ vars.DEPLOY_APP_HOST != '' && vars.DEPLOY_APP_HOST || '127.0.0.1' }}
-      DEPLOY_APP_PORT: ${{ vars.DEPLOY_APP_PORT != '' && vars.DEPLOY_APP_PORT || '8000' }}
+      DEPLOY_PORT: "${{ vars.DEPLOY_PORT != '' && vars.DEPLOY_PORT || '22' }}"
+      DEPLOY_PATH: "${{ vars.DEPLOY_PATH != '' && vars.DEPLOY_PATH || '/opt/telegram-content-agent' }}"
+      DEPLOY_ENV_FILE: "${{ vars.DEPLOY_ENV_FILE != '' && vars.DEPLOY_ENV_FILE || '/opt/telegram-content-agent/.env.production' }}"
+      DEPLOY_SERVICE_NAME: "${{ vars.DEPLOY_SERVICE_NAME != '' && vars.DEPLOY_SERVICE_NAME || 'telegram-content-agent' }}"
+      DEPLOY_APP_HOST: "${{ vars.DEPLOY_APP_HOST != '' && vars.DEPLOY_APP_HOST || '127.0.0.1' }}"
+      DEPLOY_APP_PORT: "${{ vars.DEPLOY_APP_PORT != '' && vars.DEPLOY_APP_PORT || '8000' }}"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          ref: "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
 
       - name: Set up SSH
         run: |
@@ -51,6 +51,7 @@ jobs:
           rsync -az --delete \
             --exclude '.git/' \
             --exclude '.github/' \
+            --exclude 'data/' \
             --exclude '.env.production' \
             --exclude '.venv/' \
             --exclude '__pycache__/' \
