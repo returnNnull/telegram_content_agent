@@ -1,19 +1,25 @@
 # telegram-content-agent
 
-Сервис для публикации постов в Telegram-канал через Bot API.
+Сервис для публикации Telegram-статей через два бота на одном сервере.
 
-Поддерживает:
-- текст
-- ссылки
-- одну или несколько картинок
-- dry-run режим без отправки
+Новый основной flow:
+- внешний агент или скрипт отправляет готовую статью в `POST /drafts`
+- moderation bot публикует черновик в вашу группу
+- в группе вы нажимаете `Опубликовать сейчас` или `Запланировать`
+- при подтверждении publisher bot отправляет статью в основной канал
+- при отложенной публикации время задается прямо в группе сообщением
+
+Дополнительно сервис оставляет прямые `POST /publish` и `POST /schedule` как bypass для ручных или аварийных сценариев.
 
 ## Что есть в проекте
 
-- HTTP API на FastAPI
-- отправка в канал через `sendMessage`, `sendPhoto`, `sendMediaGroup`
-- поддержка ссылок как inline-кнопок или как блока ссылок в тексте
-- публикация по умолчанию в канал из переменных окружения
+- FastAPI-сервер
+- publisher bot для основного канала
+- moderation bot для review-группы
+- long polling для обработки callback и ввода времени без webhook
+- SQLite для хранения draft-ов и отложенных публикаций
+- scheduler с retry для отложенных постов
+- поддержка текста, ссылок, одной или нескольких картинок
 
 ## Быстрый старт
 
@@ -40,84 +46,113 @@ uvicorn telegram_content_agent.main:app --host 0.0.0.0 --port 8000
 
 ## Переменные окружения
 
-- `TELEGRAM_BOT_TOKEN` — токен Telegram-бота
+- `TELEGRAM_BOT_TOKEN` — токен publisher bot для основного канала
 - `TELEGRAM_CHANNEL_ID` — ID канала или `@channel_username`
-- `PUBLISH_API_TOKEN` — bearer token для защиты `POST /publish`
-- `TELEGRAM_API_BASE` — базовый URL Telegram API
-- `REQUEST_TIMEOUT_SECONDS` — timeout HTTP-запросов
+- `MODERATION_BOT_TOKEN` — токен moderation bot для review-чата
+- `MODERATION_CHAT_ID` — ID группы, где вы подтверждаете публикации
+- `MODERATION_TIMEZONE` — timezone для ввода времени в чате, по умолчанию `Europe/Moscow`
+- `MODERATION_ALLOWED_USER_IDS` — список Telegram user id через запятую; если пусто, модерировать может любой участник `MODERATION_CHAT_ID`
+- `MODERATION_POLL_INTERVAL_SECONDS` — пауза между циклами polling
+- `MODERATION_POLL_TIMEOUT_SECONDS` — timeout одного `getUpdates`
+- `PUBLISH_API_TOKEN` — bearer token для защищенных endpoint'ов
+- `TELEGRAM_API_BASE` — базовый URL Telegram Bot API
+- `REQUEST_TIMEOUT_SECONDS` — timeout HTTP-запросов к Telegram
 - `DEFAULT_PARSE_MODE` — сейчас поддержан `HTML` или пустое значение
 - `DEFAULT_LINK_STYLE` — `buttons` или `text`
+- `SCHEDULER_DB_PATH` — путь к SQLite-базе runtime-состояния
+- `SCHEDULER_POLL_INTERVAL_SECONDS` — как часто воркер проверяет due-задачи
+- `SCHEDULER_BATCH_SIZE` — сколько задач забирать за один цикл
+- `SCHEDULER_RETRY_DELAY_SECONDS` — задержка перед повторной попыткой
+- `SCHEDULER_MAX_ATTEMPTS` — максимум попыток отправки отложенного поста
 
 ## API
 
 ### `GET /health`
 
-Проверка, что сервер поднялся и прочитал конфигурацию.
+Проверка, что сервер поднялся и прочитал конфигурацию обоих ботов.
 
-### `POST /publish`
+### `POST /drafts`
 
-Публикация поста в канал.
-
-Пример с текстом, картинками и ссылками:
+Основной endpoint. Создает moderation draft, отправляет статью в review-группу и публикует control message с кнопками.
 
 ```bash
-curl -X POST http://localhost:8000/publish \
+curl -X POST http://localhost:8000/drafts \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer replace_with_long_random_token" \
   -d '{
-    "text": "<b>Новый пост</b>\n\nРазобрали свежие изменения в проекте.",
+    "text": "<b>Новая статья</b>\n\nЭто черновик для review.",
     "parse_mode": "HTML",
     "link_style": "buttons",
     "links": [
       {
-        "title": "GitHub",
-        "url": "https://github.com/example/project/pull/123"
-      },
-      {
-        "title": "Документация",
-        "url": "https://example.com/docs"
+        "title": "Спецификация",
+        "url": "https://example.com/spec"
       }
     ],
     "images": [
       {
-        "url": "https://images.unsplash.com/photo-1516117172878-fd2c41f4a759"
-      },
-      {
-        "path": "/absolute/path/to/local-image.png"
+        "url": "https://example.com/preview.png"
       }
     ]
   }'
 ```
 
-Пример dry-run без публикации:
+После этого moderation bot:
+- отправит саму статью в `MODERATION_CHAT_ID`
+- отдельным сообщением покажет статус черновика и кнопки
+- по кнопке `Запланировать` попросит прислать время отдельным сообщением
 
-```bash
-curl -X POST http://localhost:8000/publish \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer replace_with_long_random_token" \
-  -d '{
-    "text": "Проверка публикации",
-    "dry_run": true,
-    "links": [
-      {
-        "title": "Репозиторий",
-        "url": "https://github.com/example/project"
-      }
-    ]
-  }'
-```
+Поддерживаемые форматы времени в чате:
+- `2026-03-23 10:30`
+- `23.03.2026 10:30`
+- `10:30`
+- `2026-03-23T10:30:00+03:00`
 
-## Поведение при отправке
+Отменить режим ввода времени можно сообщением `/cancel`.
 
-- Если картинок нет, сервер вызывает `sendMessage`
-- Если картинка одна, сервер вызывает `sendPhoto`
-- Если картинок несколько, сервер вызывает `sendMediaGroup`
-- Если текст длиннее лимита caption в Telegram, сервер отправляет картинки и отдельное сообщение с текстом
-- Если ссылки переданы как `buttons`, они отправляются как inline-кнопки
-- Если ссылки переданы как `text`, они добавляются в конец текста поста
+### `GET /drafts`
+
+Список черновиков. Можно фильтровать по `?status=pending_review`.
+
+### `GET /drafts/{id}`
+
+Детали одного moderation draft.
+
+### `POST /publish`
+
+Прямой publish в канал через publisher bot. Это обход moderation flow.
+
+### `POST /schedule`
+
+Прямое создание отложенной публикации в канал. Это тоже bypass-сценарий.
+
+### `GET /schedule`
+
+Список отложенных задач.
+
+### `GET /schedule/{id}`
+
+Детали одной отложенной публикации.
+
+### `DELETE /schedule/{id}`
+
+Отмена задачи в статусе `pending` или `failed`.
+
+## Поведение сервиса
+
+- moderation flow использует два разных bot token в одном процессе
+- preview в review-группе уходит через moderation bot
+- публикация в канал уходит через publisher bot
+- если в группе выбрано время, scheduler публикует пост позже автоматически
+- scheduler обновляет статус draft-а после фактической публикации
+- если картинок нет, используется `sendMessage`
+- если картинка одна, используется `sendPhoto`
+- если картинок несколько, используется `sendMediaGroup`
+- если caption не влезает, сервис отправит картинки и отдельное сообщение с текстом
 
 ## Документация
 
 - [Спецификация](docs/spec.md)
 - [Сервер и API](docs/server.md)
 - [Деплой и GitHub Actions](docs/deployment.md)
+- [Публикация из другого чата](docs/publishing-from-chat.md)

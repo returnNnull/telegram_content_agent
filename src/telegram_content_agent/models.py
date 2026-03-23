@@ -1,11 +1,21 @@
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
 
 
 ParseMode = Literal["HTML"] | None
 LinkStyle = Literal["buttons", "text"]
+ScheduledPostStatus = Literal["pending", "processing", "published", "failed", "canceled"]
+ModerationDraftStatus = Literal[
+    "pending_review",
+    "awaiting_schedule",
+    "scheduled",
+    "published",
+    "rejected",
+    "failed",
+]
 
 
 class LinkItem(BaseModel):
@@ -51,3 +61,53 @@ class PublishResponse(BaseModel):
     rendered_text: str
     actions: list[dict]
     telegram_results: list[dict] = Field(default_factory=list)
+
+
+class SchedulePublishRequest(PublishRequest):
+    publish_at: datetime
+
+    @model_validator(mode="after")
+    def validate_schedule_request(self) -> "SchedulePublishRequest":
+        if self.dry_run:
+            raise ValueError("Scheduled posts do not support dry_run.")
+        if self.publish_at.tzinfo is None or self.publish_at.utcoffset() is None:
+            raise ValueError("publish_at must include timezone information.")
+        if self.publish_at.astimezone(UTC) <= datetime.now(UTC):
+            raise ValueError("publish_at must be in the future.")
+        return self
+
+
+class SubmitDraftRequest(PublishRequest):
+    @model_validator(mode="after")
+    def validate_submit_request(self) -> "SubmitDraftRequest":
+        if self.dry_run:
+            raise ValueError("Draft submission does not support dry_run.")
+        return self
+
+
+class ScheduledPostResponse(BaseModel):
+    id: str
+    status: ScheduledPostStatus
+    publish_at: datetime
+    next_attempt_at: datetime
+    created_at: datetime
+    updated_at: datetime
+    published_at: datetime | None = None
+    attempts: int = 0
+    last_error: str | None = None
+    request: PublishRequest
+    last_result: dict[str, Any] | None = None
+
+
+class ModerationDraftResponse(BaseModel):
+    id: str
+    status: ModerationDraftStatus
+    created_at: datetime
+    updated_at: datetime
+    published_at: datetime | None = None
+    rejected_at: datetime | None = None
+    scheduled_publish_at: datetime | None = None
+    scheduled_post_id: str | None = None
+    last_error: str | None = None
+    request: PublishRequest
+    publication_result: dict[str, Any] | None = None

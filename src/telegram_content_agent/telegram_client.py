@@ -17,10 +17,17 @@ class TelegramPublishError(RuntimeError):
 
 
 class TelegramPublisher:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        bot_token: str | None = None,
+        default_chat_id: str | None = None,
+    ) -> None:
         self._settings = settings
+        self._default_chat_id = default_chat_id or settings.telegram_channel_id
         self._base_url = (
-            f"{settings.telegram_api_base.rstrip('/')}/bot{settings.telegram_bot_token}"
+            f"{settings.telegram_api_base.rstrip('/')}/bot{bot_token or settings.telegram_bot_token}"
         )
         self._client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
 
@@ -29,7 +36,7 @@ class TelegramPublisher:
 
     async def publish(self, request: PublishRequest) -> dict[str, Any]:
         link_style = request.link_style or self._settings.default_link_style
-        chat_id = request.chat_id or self._settings.telegram_channel_id
+        chat_id = request.chat_id or self._default_chat_id
         rendered_text = self._render_text(
             text=request.text.strip(),
             links=request.links,
@@ -158,6 +165,88 @@ class TelegramPublisher:
             "actions": actions,
             "telegram_results": telegram_results,
         }
+
+    async def send_message(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        parse_mode: ParseMode = "HTML",
+        reply_markup: dict[str, Any] | str | None = None,
+        disable_web_page_preview: bool = True,
+        disable_notification: bool = False,
+        protect_content: bool = False,
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": disable_web_page_preview,
+            "disable_notification": disable_notification,
+            "protect_content": protect_content,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = self._serialize_reply_markup(reply_markup)
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+        return await self._post_json("sendMessage", payload)
+
+    async def edit_message_text(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        parse_mode: ParseMode = "HTML",
+        reply_markup: dict[str, Any] | str | None = None,
+        disable_web_page_preview: bool = True,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": disable_web_page_preview,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = self._serialize_reply_markup(reply_markup)
+        return await self._post_json("editMessageText", payload)
+
+    async def answer_callback_query(
+        self,
+        *,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        }
+        if text:
+            payload["text"] = text
+        return await self._post_json("answerCallbackQuery", payload)
+
+    async def get_updates(
+        self,
+        *,
+        offset: int | None = None,
+        timeout: int = 20,
+        allowed_updates: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {"timeout": timeout}
+        if offset is not None:
+            payload["offset"] = offset
+        if allowed_updates is not None:
+            payload["allowed_updates"] = json.dumps(allowed_updates, ensure_ascii=False)
+        response = await self._post_json("getUpdates", payload)
+        result = response.get("result", [])
+        if not isinstance(result, list):
+            raise TelegramPublishError("Telegram getUpdates returned non-list result.")
+        return result
 
     def _build_message_payload(
         self,
@@ -330,6 +419,11 @@ class TelegramPublisher:
             else:
                 serialized[key] = value
         return serialized
+
+    def _serialize_reply_markup(self, reply_markup: dict[str, Any] | str) -> str:
+        if isinstance(reply_markup, str):
+            return reply_markup
+        return json.dumps(reply_markup, ensure_ascii=False)
 
     def _validate_image_path(self, image_path: Path) -> Path:
         if not image_path.is_absolute():
