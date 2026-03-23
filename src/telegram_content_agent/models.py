@@ -11,6 +11,17 @@ ScheduledPostStatus = Literal["pending", "processing", "published", "failed", "c
 ModerationDraftStatus = Literal[
     "pending_review",
     "awaiting_schedule",
+    "awaiting_rejection_comment",
+    "scheduled",
+    "published",
+    "rejected",
+    "failed",
+]
+ArticleStatus = Literal[
+    "draft",
+    "pending_review",
+    "awaiting_schedule",
+    "awaiting_rejection_comment",
     "scheduled",
     "published",
     "rejected",
@@ -37,7 +48,7 @@ class ImageItem(BaseModel):
 
 
 class PublishRequest(BaseModel):
-    text: str = Field(default="", max_length=4096)
+    text: str = Field(default="")
     parse_mode: ParseMode = "HTML"
     images: list[ImageItem] = Field(default_factory=list, max_length=10)
     links: list[LinkItem] = Field(default_factory=list, max_length=10)
@@ -52,6 +63,8 @@ class PublishRequest(BaseModel):
     def validate_payload(self) -> "PublishRequest":
         if not self.text.strip() and not self.images and not self.links:
             raise ValueError("Request must include text, images, or links.")
+        if self.parse_mode == "HTML" and len(self.text) > 4096:
+            raise ValueError("HTML messages support up to 4096 characters.")
         return self
 
 
@@ -111,3 +124,32 @@ class ModerationDraftResponse(BaseModel):
     last_error: str | None = None
     request: PublishRequest
     publication_result: dict[str, Any] | None = None
+    article_id: str | None = None
+    article_attempt: int | None = None
+    article_source_hash: str | None = None
+
+
+class ArticleResponse(BaseModel):
+    id: str
+    source_path: Path
+    publication: str
+    slug: str
+    title: str
+    status: ArticleStatus
+    created_at: datetime
+    updated_at: datetime
+    current_source_hash: str
+    last_submitted_hash: str | None = None
+    current_draft_id: str | None = None
+    published_at: datetime | None = None
+    last_error: str | None = None
+
+
+class ArticleCommentResponse(BaseModel):
+    id: str
+    draft_id: str
+    article_id: str | None = None
+    body: str
+    moderator_user_id: int
+    created_at: datetime
+    applied_at: datetime | None = None

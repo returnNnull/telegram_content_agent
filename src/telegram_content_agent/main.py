@@ -5,6 +5,11 @@ from secrets import compare_digest
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 
+from telegram_content_agent.articles import (
+    ArticleLifecycleService,
+    ArticleNotFoundError,
+    ArticleStore,
+)
 from telegram_content_agent.config import get_settings
 from telegram_content_agent.moderation import (
     ModerationBotRunner,
@@ -13,6 +18,9 @@ from telegram_content_agent.moderation import (
     ModerationStore,
 )
 from telegram_content_agent.models import (
+    ArticleCommentResponse,
+    ArticleResponse,
+    ArticleStatus,
     ModerationDraftStatus,
     ModerationDraftResponse,
     PublishRequest,
@@ -46,16 +54,24 @@ async def lifespan(app: FastAPI):
     )
     store = ScheduledPostStore(settings.scheduler_db_path)
     moderation_store = ModerationStore(settings.scheduler_db_path)
+    article_store = ArticleStore(settings.scheduler_db_path)
     store.initialize()
     moderation_store.initialize()
+    article_store.initialize()
     store.recover_processing_posts()
     scheduler = ScheduledPublisher(settings=settings, publisher=publisher, store=store)
     moderation_service = ModerationService(
         settings=settings,
         store=moderation_store,
+        article_store=article_store,
         moderation_publisher=moderation_publisher,
         channel_publisher=publisher,
         scheduler=scheduler,
+    )
+    article_service = ArticleLifecycleService(
+        settings=settings,
+        store=article_store,
+        submit_article_draft=moderation_service.submit_article_draft,
     )
     scheduler.set_event_handlers(
         on_post_published=moderation_service.sync_scheduled_post,
@@ -68,12 +84,15 @@ async def lifespan(app: FastAPI):
     )
     await scheduler.start()
     await moderation_runner.start()
+    await article_service.sync_on_startup()
     app.state.publisher = publisher
     app.state.moderation_publisher = moderation_publisher
     app.state.scheduler = scheduler
     app.state.moderation_store = moderation_store
+    app.state.article_store = article_store
     app.state.moderation_service = moderation_service
     app.state.moderation_runner = moderation_runner
+    app.state.article_service = article_service
     app.state.settings = settings
     try:
         yield
@@ -167,6 +186,45 @@ async def get_draft(
         return moderation_store.get(draft_id)
     except ModerationDraftNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.get("/drafts/{draft_id}/comments", response_model=list[ArticleCommentResponse])
+async def list_draft_comments(
+    draft_id: str,
+    _: None = Depends(verify_publish_token),
+) -> list[ArticleCommentResponse]:
+    article_store: ArticleStore = app.state.article_store
+    return article_store.list_comments(draft_id=draft_id)
+
+
+@app.get("/articles", response_model=list[ArticleResponse])
+async def list_articles(
+    status_filter: ArticleStatus | None = Query(default=None, alias="status"),
+    _: None = Depends(verify_publish_token),
+) -> list[ArticleResponse]:
+    article_store: ArticleStore = app.state.article_store
+    return article_store.list(status=status_filter)
+
+
+@app.get("/articles/{article_id}", response_model=ArticleResponse)
+async def get_article(
+    article_id: str,
+    _: None = Depends(verify_publish_token),
+) -> ArticleResponse:
+    article_store: ArticleStore = app.state.article_store
+    try:
+        return article_store.get(article_id)
+    except ArticleNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.get("/articles/{article_id}/comments", response_model=list[ArticleCommentResponse])
+async def list_article_comments(
+    article_id: str,
+    _: None = Depends(verify_publish_token),
+) -> list[ArticleCommentResponse]:
+    article_store: ArticleStore = app.state.article_store
+    return article_store.list_comments(article_id=article_id)
 
 
 @app.post("/schedule", response_model=ScheduledPostResponse)

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from telegram_content_agent.articles import ArticleStore
 from telegram_content_agent.config import Settings
 from telegram_content_agent.models import (
     ModerationDraftResponse,
@@ -47,6 +48,9 @@ class ModerationDraftRecord:
     publication_result: dict[str, Any] | None
     review_chat_id: str | None
     review_control_message_id: int | None
+    article_id: str | None
+    article_attempt: int | None
+    article_source_hash: str | None
 
     def to_response(self) -> ModerationDraftResponse:
         return ModerationDraftResponse(
@@ -61,6 +65,9 @@ class ModerationDraftRecord:
             last_error=self.last_error,
             request=self.request,
             publication_result=self.publication_result,
+            article_id=self.article_id,
+            article_attempt=self.article_attempt,
+            article_source_hash=self.article_source_hash,
         )
 
 
@@ -88,13 +95,30 @@ class ModerationStore:
                     request_json TEXT NOT NULL,
                     publication_result_json TEXT,
                     review_chat_id TEXT,
-                    review_control_message_id INTEGER
+                    review_control_message_id INTEGER,
+                    article_id TEXT,
+                    article_attempt INTEGER,
+                    article_source_hash TEXT
+                )
+                """
+            )
+            self._ensure_column(connection, "moderation_drafts", "article_id", "TEXT")
+            self._ensure_column(connection, "moderation_drafts", "article_attempt", "INTEGER")
+            self._ensure_column(connection, "moderation_drafts", "article_source_hash", "TEXT")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_schedule_inputs (
+                    chat_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    draft_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
                 )
                 """
             )
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS pending_schedule_inputs (
+                CREATE TABLE IF NOT EXISTS pending_rejection_inputs (
                     chat_id TEXT NOT NULL,
                     user_id INTEGER NOT NULL,
                     draft_id TEXT NOT NULL,
@@ -112,7 +136,14 @@ class ModerationStore:
             )
             connection.commit()
 
-    def create_draft(self, request: PublishRequest) -> ModerationDraftRecord:
+    def create_draft(
+        self,
+        request: PublishRequest,
+        *,
+        article_id: str | None = None,
+        article_attempt: int | None = None,
+        article_source_hash: str | None = None,
+    ) -> ModerationDraftRecord:
         now = datetime.now(UTC)
         draft_id = uuid4().hex
         row = {
@@ -129,6 +160,9 @@ class ModerationStore:
             "publication_result_json": None,
             "review_chat_id": None,
             "review_control_message_id": None,
+            "article_id": article_id,
+            "article_attempt": article_attempt,
+            "article_source_hash": article_source_hash,
         }
         with self._connect() as connection:
             connection.execute(
@@ -136,11 +170,13 @@ class ModerationStore:
                 INSERT INTO moderation_drafts (
                     id, status, created_at, updated_at, published_at, rejected_at,
                     scheduled_publish_at, scheduled_post_id, last_error, request_json,
-                    publication_result_json, review_chat_id, review_control_message_id
+                    publication_result_json, review_chat_id, review_control_message_id,
+                    article_id, article_attempt, article_source_hash
                 ) VALUES (
                     :id, :status, :created_at, :updated_at, :published_at, :rejected_at,
                     :scheduled_publish_at, :scheduled_post_id, :last_error, :request_json,
-                    :publication_result_json, :review_chat_id, :review_control_message_id
+                    :publication_result_json, :review_chat_id, :review_control_message_id,
+                    :article_id, :article_attempt, :article_source_hash
                 )
                 """,
                 row,
@@ -221,6 +257,26 @@ class ModerationStore:
             (self._iso(datetime.now(UTC)), draft_id),
         )
 
+    def mark_awaiting_rejection_comment(self, draft_id: str) -> ModerationDraftRecord:
+        current = self.get_record(draft_id)
+        if current.status == "awaiting_rejection_comment":
+            return current
+        if current.status not in {"pending_review", "awaiting_schedule"}:
+            raise ModerationDraftConflictError(
+                "Only pending_review or awaiting_schedule drafts can wait for rejection comment."
+            )
+        return self._update_record(
+            draft_id,
+            """
+            UPDATE moderation_drafts
+            SET status = 'awaiting_rejection_comment',
+                updated_at = ?,
+                last_error = NULL
+            WHERE id = ?
+            """,
+            (self._iso(datetime.now(UTC)), draft_id),
+        )
+
     def reset_to_pending_review(self, draft_id: str) -> ModerationDraftRecord:
         current = self.get_record(draft_id)
         if current.status == "pending_review":
@@ -241,13 +297,37 @@ class ModerationStore:
             (self._iso(datetime.now(UTC)), draft_id),
         )
 
+    def reset_rejection_request(self, draft_id: str) -> ModerationDraftRecord:
+        current = self.get_record(draft_id)
+        if current.status == "pending_review":
+            return current
+        if current.status != "awaiting_rejection_comment":
+            raise ModerationDraftConflictError(
+                "Only drafts waiting for rejection comment can return to pending_review."
+            )
+        return self._update_record(
+            draft_id,
+            """
+            UPDATE moderation_drafts
+            SET status = 'pending_review',
+                updated_at = ?,
+                last_error = NULL
+            WHERE id = ?
+            """,
+            (self._iso(datetime.now(UTC)), draft_id),
+        )
+
     def mark_rejected(self, draft_id: str) -> ModerationDraftRecord:
         current = self.get_record(draft_id)
         if current.status == "rejected":
             return current
-        if current.status not in {"pending_review", "awaiting_schedule"}:
+        if current.status not in {
+            "pending_review",
+            "awaiting_schedule",
+            "awaiting_rejection_comment",
+        }:
             raise ModerationDraftConflictError(
-                "Only pending_review or awaiting_schedule drafts can be rejected."
+                "Only pending_review, awaiting_schedule or awaiting_rejection_comment drafts can be rejected."
             )
         now = datetime.now(UTC)
         return self._update_record(
@@ -329,7 +409,12 @@ class ModerationStore:
         current = self.get_record(draft_id)
         if current.status == "failed":
             return current
-        if current.status not in {"pending_review", "awaiting_schedule", "scheduled"}:
+        if current.status not in {
+            "pending_review",
+            "awaiting_schedule",
+            "awaiting_rejection_comment",
+            "scheduled",
+        }:
             raise ModerationDraftConflictError("Draft cannot be marked as failed.")
         return self._update_record(
             draft_id,
@@ -389,6 +474,52 @@ class ModerationStore:
             )
             connection.commit()
 
+    def set_pending_rejection(self, *, chat_id: str, user_id: int, draft_id: str) -> None:
+        created_at = self._iso(datetime.now(UTC))
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM pending_rejection_inputs WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO pending_rejection_inputs (chat_id, user_id, draft_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, user_id, draft_id, created_at),
+            )
+            connection.commit()
+
+    def get_pending_rejection(self, *, chat_id: str, user_id: int) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT draft_id
+                FROM pending_rejection_inputs
+                WHERE chat_id = ? AND user_id = ?
+                """,
+                (chat_id, user_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["draft_id"]
+
+    def clear_pending_rejection(self, *, chat_id: str, user_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM pending_rejection_inputs WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id),
+            )
+            connection.commit()
+
+    def clear_pending_rejection_for_draft(self, draft_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM pending_rejection_inputs WHERE draft_id = ?",
+                (draft_id,),
+            )
+            connection.commit()
+
     def _update_record(
         self,
         draft_id: str,
@@ -423,6 +554,24 @@ class ModerationStore:
             publication_result=json.loads(publication_result) if publication_result else None,
             review_chat_id=row["review_chat_id"],
             review_control_message_id=row["review_control_message_id"],
+            article_id=row["article_id"],
+            article_attempt=row["article_attempt"],
+            article_source_hash=row["article_source_hash"],
+        )
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_definition: str,
+    ) -> None:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        existing_columns = {row["name"] for row in rows}
+        if column_name in existing_columns:
+            return
+        connection.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
         )
 
     @staticmethod
@@ -444,6 +593,7 @@ class ModerationService:
     _STATUS_LABELS = {
         "pending_review": "ждет подтверждения",
         "awaiting_schedule": "ждет время публикации",
+        "awaiting_rejection_comment": "ждет комментарий к отклонению",
         "scheduled": "запланирован",
         "published": "опубликован",
         "rejected": "отклонен",
@@ -455,12 +605,14 @@ class ModerationService:
         *,
         settings: Settings,
         store: ModerationStore,
+        article_store: ArticleStore | None,
         moderation_publisher: TelegramPublisher,
         channel_publisher: TelegramPublisher,
         scheduler: ScheduledPublisher,
     ) -> None:
         self._settings = settings
         self._store = store
+        self._article_store = article_store
         self._moderation_publisher = moderation_publisher
         self._channel_publisher = channel_publisher
         self._scheduler = scheduler
@@ -472,10 +624,48 @@ class ModerationService:
                 exclude={"dry_run", "chat_id"},
             )
         )
-        draft = self._store.create_draft(sanitized_request)
+        draft = await self._submit_internal(sanitized_request)
+        return draft.to_response()
+
+    async def submit_article_draft(
+        self,
+        article_id: str,
+        request: PublishRequest,
+        source_hash: str,
+        article_attempt: int,
+    ) -> ModerationDraftResponse:
+        draft = await self._submit_internal(
+            request,
+            article_id=article_id,
+            article_source_hash=source_hash,
+            article_attempt=article_attempt,
+        )
+        return draft.to_response()
+
+    async def _submit_internal(
+        self,
+        request: PublishRequest,
+        *,
+        article_id: str | None = None,
+        article_source_hash: str | None = None,
+        article_attempt: int | None = None,
+    ) -> ModerationDraftRecord:
+        draft = self._store.create_draft(
+            request,
+            article_id=article_id,
+            article_attempt=article_attempt,
+            article_source_hash=article_source_hash,
+        )
+        if self._article_store is not None and article_id is not None and article_source_hash is not None:
+            self._article_store.attach_draft(
+                article_id,
+                draft_id=draft.id,
+                source_hash=article_source_hash,
+                status=draft.status,
+            )
         try:
             await self._moderation_publisher.publish(
-                sanitized_request.model_copy(
+                request.model_copy(
                     update={
                         "dry_run": False,
                         "chat_id": self._settings.moderation_chat_id,
@@ -495,12 +685,15 @@ class ModerationService:
                 message_id=control_response["result"]["message_id"],
             )
         except Exception as error:
-            self._store.mark_failed(
+            draft = self._store.mark_failed(
                 draft.id,
                 error_message=f"Failed to deliver draft to moderation chat: {error}",
             )
+            self._sync_article_status(draft)
             raise
-        return self._store.get(draft.id)
+        draft = self._store.get_record(draft.id)
+        self._sync_article_status(draft)
+        return draft
 
     async def handle_update(self, update: dict[str, Any]) -> None:
         callback_query = update.get("callback_query")
@@ -527,6 +720,7 @@ class ModerationService:
             )
         else:
             return
+        self._sync_article_status(draft)
         await self._refresh_control_message(draft)
 
     async def _handle_callback_query(self, callback_query: dict[str, Any]) -> None:
@@ -591,10 +785,24 @@ class ModerationService:
             )
             return
         if action == "reject":
-            await self._reject_draft(draft, callback_query_id=callback_query_id)
+            await self._request_rejection_comment(
+                draft,
+                chat_id=chat_id,
+                user_id=user_id,
+                reply_to_message_id=message.get("message_id"),
+                callback_query_id=callback_query_id,
+            )
             return
         if action == "reset":
             await self._reset_schedule_request(
+                draft,
+                chat_id=chat_id,
+                user_id=user_id,
+                callback_query_id=callback_query_id,
+            )
+            return
+        if action == "cancel_reject":
+            await self._reset_rejection_request(
                 draft,
                 chat_id=chat_id,
                 user_id=user_id,
@@ -616,58 +824,103 @@ class ModerationService:
         if not text:
             return
 
-        draft_id = self._store.get_pending_schedule(chat_id=chat_id, user_id=user_id)
-        if draft_id is None:
+        schedule_draft_id = self._store.get_pending_schedule(chat_id=chat_id, user_id=user_id)
+        rejection_draft_id = self._store.get_pending_rejection(chat_id=chat_id, user_id=user_id)
+        if schedule_draft_id is None and rejection_draft_id is None:
             return
 
         if text.lower() == "/cancel":
-            try:
-                draft = self._store.reset_to_pending_review(draft_id)
-            except (ModerationDraftConflictError, ModerationDraftNotFoundError):
+            if schedule_draft_id is not None:
+                try:
+                    draft = self._store.reset_to_pending_review(schedule_draft_id)
+                except (ModerationDraftConflictError, ModerationDraftNotFoundError):
+                    self._store.clear_pending_schedule(chat_id=chat_id, user_id=user_id)
+                    return
                 self._store.clear_pending_schedule(chat_id=chat_id, user_id=user_id)
+                self._sync_article_status(draft)
+                await self._refresh_control_message(draft)
+                await self._moderation_publisher.send_message(
+                    chat_id=chat_id,
+                    text="Ввод времени отменен. Черновик снова ждет решения.",
+                    reply_to_message_id=message.get("message_id"),
+                )
                 return
-            self._store.clear_pending_schedule(chat_id=chat_id, user_id=user_id)
+
+            try:
+                draft = self._store.reset_rejection_request(rejection_draft_id)
+            except (ModerationDraftConflictError, ModerationDraftNotFoundError):
+                self._store.clear_pending_rejection(chat_id=chat_id, user_id=user_id)
+                return
+            self._store.clear_pending_rejection(chat_id=chat_id, user_id=user_id)
+            self._sync_article_status(draft)
             await self._refresh_control_message(draft)
             await self._moderation_publisher.send_message(
                 chat_id=chat_id,
-                text="Ввод времени отменен. Черновик снова ждет решения.",
+                text="Отклонение отменено. Черновик снова ждет решения.",
                 reply_to_message_id=message.get("message_id"),
             )
             return
 
-        publish_at = self._parse_publish_time(text)
-        if publish_at is None:
+        if schedule_draft_id is not None:
+            publish_at = self._parse_publish_time(text)
+            if publish_at is None:
+                await self._moderation_publisher.send_message(
+                    chat_id=chat_id,
+                    text=self._schedule_prompt(invalid_value=text),
+                    reply_to_message_id=message.get("message_id"),
+                    disable_web_page_preview=True,
+                )
+                return
+
+            try:
+                draft = self._store.get_record(schedule_draft_id)
+                scheduled_post = self._scheduler.create(
+                    request=draft.request.model_copy(update={"dry_run": False, "chat_id": None}),
+                    publish_at=publish_at,
+                )
+                self._store.clear_pending_schedule(chat_id=chat_id, user_id=user_id)
+                draft = self._store.mark_scheduled(
+                    draft.id,
+                    scheduled_post_id=scheduled_post.id,
+                    publish_at=publish_at,
+                )
+            except (ModerationDraftConflictError, ModerationDraftNotFoundError):
+                self._store.clear_pending_schedule(chat_id=chat_id, user_id=user_id)
+                return
+
+            self._sync_article_status(draft)
+            await self._refresh_control_message(draft)
             await self._moderation_publisher.send_message(
                 chat_id=chat_id,
-                text=self._schedule_prompt(invalid_value=text),
+                text=(
+                    "Публикация запланирована на "
+                    f"{self._format_datetime(publish_at)} ({self._settings.moderation_timezone})."
+                ),
                 reply_to_message_id=message.get("message_id"),
-                disable_web_page_preview=True,
             )
             return
 
         try:
-            draft = self._store.get_record(draft_id)
-            scheduled_post = self._scheduler.create(
-                request=draft.request.model_copy(update={"dry_run": False, "chat_id": None}),
-                publish_at=publish_at,
-            )
-            self._store.clear_pending_schedule(chat_id=chat_id, user_id=user_id)
-            draft = self._store.mark_scheduled(
-                draft.id,
-                scheduled_post_id=scheduled_post.id,
-                publish_at=publish_at,
-            )
+            draft = self._store.get_record(rejection_draft_id)
+            if self._article_store is not None:
+                self._article_store.create_comment(
+                    draft_id=draft.id,
+                    article_id=draft.article_id,
+                    body=text,
+                    moderator_user_id=user_id,
+                )
+            self._store.clear_pending_rejection(chat_id=chat_id, user_id=user_id)
+            self._store.clear_pending_rejection_for_draft(draft.id)
+            draft = self._store.mark_rejected(draft.id)
         except (ModerationDraftConflictError, ModerationDraftNotFoundError):
-            self._store.clear_pending_schedule(chat_id=chat_id, user_id=user_id)
+            self._store.clear_pending_rejection(chat_id=chat_id, user_id=user_id)
             return
 
+        self._sync_article_status(draft)
         await self._refresh_control_message(draft)
         await self._moderation_publisher.send_message(
             chat_id=chat_id,
-            text=(
-                "Публикация запланирована на "
-                f"{self._format_datetime(publish_at)} ({self._settings.moderation_timezone})."
-            ),
+            text="Черновик отклонен. Комментарий сохранен.",
             reply_to_message_id=message.get("message_id"),
         )
 
@@ -700,7 +953,9 @@ class ModerationService:
             return
 
         self._store.clear_pending_schedule_for_draft(draft.id)
+        self._store.clear_pending_rejection_for_draft(draft.id)
         draft = self._store.mark_published(draft.id, result=result)
+        self._sync_article_status(draft)
         await self._refresh_control_message(draft)
         if callback_query_id:
             await self._safe_answer_callback_query(
@@ -730,6 +985,8 @@ class ModerationService:
             return
 
         self._store.set_pending_schedule(chat_id=chat_id, user_id=user_id, draft_id=draft.id)
+        self._store.clear_pending_rejection_for_draft(draft.id)
+        self._sync_article_status(draft)
         await self._refresh_control_message(draft)
         await self._moderation_publisher.send_message(
             chat_id=chat_id,
@@ -744,15 +1001,19 @@ class ModerationService:
                 show_alert=False,
             )
 
-    async def _reject_draft(
+    async def _request_rejection_comment(
         self,
         draft: ModerationDraftRecord,
         *,
+        chat_id: str,
+        user_id: int,
+        reply_to_message_id: int | None,
         callback_query_id: str | None,
     ) -> None:
         try:
             self._store.clear_pending_schedule_for_draft(draft.id)
-            draft = self._store.mark_rejected(draft.id)
+            self._store.clear_pending_rejection_for_draft(draft.id)
+            draft = self._store.mark_awaiting_rejection_comment(draft.id)
         except ModerationDraftConflictError:
             if callback_query_id:
                 await self._safe_answer_callback_query(
@@ -761,11 +1022,19 @@ class ModerationService:
                     show_alert=False,
                 )
             return
+        self._store.set_pending_rejection(chat_id=chat_id, user_id=user_id, draft_id=draft.id)
+        self._sync_article_status(draft)
         await self._refresh_control_message(draft)
+        await self._moderation_publisher.send_message(
+            chat_id=chat_id,
+            text=self._rejection_prompt(),
+            reply_to_message_id=reply_to_message_id,
+            disable_web_page_preview=True,
+        )
         if callback_query_id:
             await self._safe_answer_callback_query(
                 callback_query_id,
-                text="Черновик отклонен.",
+                text="Пришлите комментарий к отклонению сообщением.",
                 show_alert=False,
             )
 
@@ -788,11 +1057,40 @@ class ModerationService:
                 )
             return
         self._store.clear_pending_schedule(chat_id=chat_id, user_id=user_id)
+        self._sync_article_status(draft)
         await self._refresh_control_message(draft)
         if callback_query_id:
             await self._safe_answer_callback_query(
                 callback_query_id,
                 text="Ожидание времени отменено.",
+                show_alert=False,
+            )
+
+    async def _reset_rejection_request(
+        self,
+        draft: ModerationDraftRecord,
+        *,
+        chat_id: str,
+        user_id: int,
+        callback_query_id: str | None,
+    ) -> None:
+        try:
+            draft = self._store.reset_rejection_request(draft.id)
+        except ModerationDraftConflictError:
+            if callback_query_id:
+                await self._safe_answer_callback_query(
+                    callback_query_id,
+                    text="Для этого черновика нет активного ввода комментария.",
+                    show_alert=False,
+                )
+            return
+        self._store.clear_pending_rejection(chat_id=chat_id, user_id=user_id)
+        self._sync_article_status(draft)
+        await self._refresh_control_message(draft)
+        if callback_query_id:
+            await self._safe_answer_callback_query(
+                callback_query_id,
+                text="Отклонение отменено.",
                 show_alert=False,
             )
 
@@ -827,17 +1125,34 @@ class ModerationService:
         except TelegramPublishError:
             return
 
+    def _sync_article_status(self, draft: ModerationDraftRecord) -> None:
+        if self._article_store is None or draft.article_id is None:
+            return
+        self._article_store.sync_status(
+            draft.article_id,
+            status=draft.status,
+            published_at=draft.published_at if draft.status == "published" else None,
+            last_error=draft.last_error,
+        )
+
     def _render_control_text(self, draft: ModerationDraftRecord) -> str:
         lines = [
             f"<b>Черновик</b> <code>{draft.id[:8]}</code>",
             f"Статус: <b>{escape(self._STATUS_LABELS.get(draft.status, draft.status))}</b>",
             f"Канал: <code>{escape(self._settings.telegram_channel_id)}</code>",
         ]
+        if draft.article_id is not None:
+            lines.append(f"Статья: <code>{escape(draft.article_id)}</code>")
         if draft.status == "awaiting_schedule":
             lines.append(
                 "Отправьте время отдельным сообщением. Поддерживаются форматы "
                 "<code>YYYY-MM-DD HH:MM</code>, <code>DD.MM.YYYY HH:MM</code>, "
                 "<code>HH:MM</code> и ISO 8601."
+            )
+        if draft.status == "awaiting_rejection_comment":
+            lines.append(
+                "Отправьте комментарий к отклонению отдельным сообщением. "
+                "Чтобы выйти из режима отклонения, отправьте <code>/cancel</code>."
             )
         if draft.scheduled_publish_at is not None:
             lines.append(
@@ -857,6 +1172,13 @@ class ModerationService:
                 f"<b>{escape(self._format_datetime(draft.rejected_at))}</b> "
                 f"({escape(self._settings.moderation_timezone)})"
             )
+        if self._article_store is not None:
+            latest_comment = self._article_store.latest_comment(draft_id=draft.id)
+            if latest_comment is not None:
+                lines.append(
+                    "Комментарий: "
+                    f"<code>{escape(self._short_error(latest_comment.body))}</code>"
+                )
         if draft.last_error:
             lines.append(f"Ошибка: <code>{escape(self._short_error(draft.last_error))}</code>")
         return "\n".join(lines)
@@ -904,6 +1226,17 @@ class ModerationService:
                     ],
                 ]
             }
+        if draft.status == "awaiting_rejection_comment":
+            return {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Отменить отклонение",
+                            "callback_data": f"draft:cancel_reject:{draft.id}",
+                        }
+                    ]
+                ]
+            }
         return {"inline_keyboard": []}
 
     def _schedule_prompt(self, *, invalid_value: str | None = None) -> str:
@@ -923,6 +1256,19 @@ class ModerationService:
             "<code>2026-03-23T10:30:00+03:00</code>\n\n"
             f"Часовой пояс по умолчанию: <b>{escape(self._settings.moderation_timezone)}</b>.\n"
             "Чтобы выйти из режима ввода времени, отправьте <code>/cancel</code>."
+        )
+
+    def _rejection_prompt(self) -> str:
+        return (
+            "Отправьте комментарий к отклонению одним сообщением.\n"
+            "Комментарий будет сохранен в БД и доступен через API.\n\n"
+            "Если хотите автоматически править статью на старте, используйте инструкции в формате:\n"
+            "<code>title: Новый заголовок</code>\n"
+            "<code>replace: старый текст => новый текст</code>\n"
+            "<code>delete: фрагмент</code>\n"
+            "<code>append: новый абзац</code>\n"
+            "<code>prepend: вводный абзац</code>\n\n"
+            "Чтобы выйти из режима отклонения, отправьте <code>/cancel</code>."
         )
 
     def _parse_publish_time(self, raw_value: str) -> datetime | None:

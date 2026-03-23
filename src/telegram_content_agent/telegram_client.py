@@ -17,6 +17,9 @@ class TelegramPublishError(RuntimeError):
 
 
 class TelegramPublisher:
+    _MAX_MESSAGE_LENGTH = 4096
+    _MAX_CAPTION_LENGTH = 1024
+
     def __init__(
         self,
         settings: Settings,
@@ -48,17 +51,18 @@ class TelegramPublisher:
         telegram_results: list[dict[str, Any]] = []
 
         if not request.images:
-            strategy = "message"
             message_text = rendered_text or ("Полезные ссылки" if request.links else " ")
-            payload = self._build_message_payload(
+            payloads = self._build_message_payloads(
                 chat_id=chat_id,
                 text=message_text,
                 request=request,
                 link_style=link_style,
             )
-            actions.append(self._summarize_action("sendMessage", payload))
-            if not request.dry_run:
-                telegram_results.append(await self._post_json("sendMessage", payload))
+            strategy = "message" if len(payloads) == 1 else "multi-message"
+            for payload in payloads:
+                actions.append(self._summarize_action("sendMessage", payload))
+                if not request.dry_run:
+                    telegram_results.append(await self._post_json("sendMessage", payload))
             return {
                 "ok": True,
                 "strategy": strategy,
@@ -70,7 +74,7 @@ class TelegramPublisher:
         if len(request.images) == 1:
             strategy = "single-image"
             image = request.images[0]
-            can_use_caption = bool(rendered_text) and len(rendered_text) <= 1024
+            can_use_caption = bool(rendered_text) and len(rendered_text) <= self._MAX_CAPTION_LENGTH
             if can_use_caption:
                 payload = self._build_photo_payload(
                     chat_id=chat_id,
@@ -98,17 +102,18 @@ class TelegramPublisher:
                         await self._post_photo("sendPhoto", photo_payload, image=image)
                     )
                 if rendered_text or request.links:
-                    message_payload = self._build_message_payload(
+                    message_payloads = self._build_message_payloads(
                         chat_id=chat_id,
                         text=rendered_text or "Полезные ссылки",
                         request=request,
                         link_style=link_style,
                     )
-                    actions.append(self._summarize_action("sendMessage", message_payload))
-                    if not request.dry_run:
-                        telegram_results.append(
-                            await self._post_json("sendMessage", message_payload)
-                        )
+                    for message_payload in message_payloads:
+                        actions.append(self._summarize_action("sendMessage", message_payload))
+                        if not request.dry_run:
+                            telegram_results.append(
+                                await self._post_json("sendMessage", message_payload)
+                            )
             return {
                 "ok": True,
                 "strategy": strategy,
@@ -120,7 +125,7 @@ class TelegramPublisher:
         strategy = "media-group"
         use_caption = (
             bool(rendered_text)
-            and len(rendered_text) <= 1024
+            and len(rendered_text) <= self._MAX_CAPTION_LENGTH
             and link_style != "buttons"
         )
         media_payload = self._build_media_group_payload(
@@ -139,25 +144,27 @@ class TelegramPublisher:
                 )
             )
         if rendered_text and not use_caption:
-            message_payload = self._build_message_payload(
+            message_payloads = self._build_message_payloads(
                 chat_id=chat_id,
                 text=rendered_text,
                 request=request,
                 link_style=link_style,
             )
-            actions.append(self._summarize_action("sendMessage", message_payload))
-            if not request.dry_run:
-                telegram_results.append(await self._post_json("sendMessage", message_payload))
+            for message_payload in message_payloads:
+                actions.append(self._summarize_action("sendMessage", message_payload))
+                if not request.dry_run:
+                    telegram_results.append(await self._post_json("sendMessage", message_payload))
         elif not rendered_text and request.links and link_style == "buttons":
-            message_payload = self._build_message_payload(
+            message_payloads = self._build_message_payloads(
                 chat_id=chat_id,
                 text="Полезные ссылки",
                 request=request,
                 link_style=link_style,
             )
-            actions.append(self._summarize_action("sendMessage", message_payload))
-            if not request.dry_run:
-                telegram_results.append(await self._post_json("sendMessage", message_payload))
+            for message_payload in message_payloads:
+                actions.append(self._summarize_action("sendMessage", message_payload))
+                if not request.dry_run:
+                    telegram_results.append(await self._post_json("sendMessage", message_payload))
         return {
             "ok": True,
             "strategy": strategy,
@@ -268,6 +275,35 @@ class TelegramPublisher:
         if link_style == "buttons" and request.links:
             payload["reply_markup"] = self._build_inline_keyboard(request.links)
         return payload
+
+    def _build_message_payloads(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        request: PublishRequest,
+        link_style: LinkStyle | None,
+    ) -> list[dict[str, Any]]:
+        if request.parse_mode is not None or len(text) <= self._MAX_MESSAGE_LENGTH:
+            return [
+                self._build_message_payload(
+                    chat_id=chat_id,
+                    text=text,
+                    request=request,
+                    link_style=link_style,
+                )
+            ]
+
+        chunks = self._split_plain_text(text, limit=self._MAX_MESSAGE_LENGTH)
+        return [
+            self._build_message_payload(
+                chat_id=chat_id,
+                text=chunk,
+                request=request,
+                link_style=link_style if index == len(chunks) - 1 else None,
+            )
+            for index, chunk in enumerate(chunks)
+        ]
 
     def _build_photo_payload(
         self,
@@ -424,6 +460,61 @@ class TelegramPublisher:
         if isinstance(reply_markup, str):
             return reply_markup
         return json.dumps(reply_markup, ensure_ascii=False)
+
+    def _split_plain_text(self, text: str, *, limit: int) -> list[str]:
+        stripped = text.strip()
+        if not stripped:
+            return [" "]
+
+        chunks: list[str] = []
+        current = ""
+        for paragraph in stripped.split("\n\n"):
+            candidate = paragraph.strip()
+            if not candidate:
+                continue
+            parts = [candidate]
+            if len(candidate) > limit:
+                parts = self._split_long_paragraph(candidate, limit=limit)
+            for part in parts:
+                separator = "\n\n" if current else ""
+                if len(current) + len(separator) + len(part) <= limit:
+                    current = f"{current}{separator}{part}"
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = part
+        if current:
+            chunks.append(current)
+        return chunks or [" "]
+
+    @staticmethod
+    def _split_long_paragraph(text: str, *, limit: int) -> list[str]:
+        words = text.split()
+        if not words:
+            return [text[:limit]]
+
+        chunks: list[str] = []
+        current = ""
+        for word in words:
+            separator = " " if current else ""
+            if len(current) + len(separator) + len(word) <= limit:
+                current = f"{current}{separator}{word}"
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+            if len(word) <= limit:
+                current = word
+                continue
+            for start in range(0, len(word), limit):
+                chunk = word[start : start + limit]
+                if len(chunk) == limit:
+                    chunks.append(chunk)
+                else:
+                    current = chunk
+        if current:
+            chunks.append(current)
+        return chunks
 
     def _validate_image_path(self, image_path: Path) -> Path:
         if not image_path.is_absolute():

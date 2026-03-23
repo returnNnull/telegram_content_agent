@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     scheduler_batch_size: int = 10
     scheduler_retry_delay_seconds: float = 60.0
     scheduler_max_attempts: int = 3
+    articles_root_path: Path = Path("publications")
+    articles_auto_sync_on_startup: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",
