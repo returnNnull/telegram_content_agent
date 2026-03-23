@@ -34,6 +34,6 @@ jobs:
       - name: Run tests
         env:
           TELEGRAM_BOT_TOKEN: test-bot-token
-          TELEGRAM_CHANNEL_ID: @test_channel
+          TELEGRAM_CHANNEL_ID: "@test_channel"
           PUBLISH_API_TOKEN: test-publish-token
         run: pytest
