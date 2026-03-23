@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
+from telegram_content_agent.articles import LocalArticleDocument, LocalArticleRepository
 from telegram_content_agent.config import get_settings
 from telegram_content_agent.main import app
 from telegram_content_agent.telegram_client import TelegramPublisher
@@ -15,7 +16,7 @@ def _reset_settings() -> None:
     get_settings.cache_clear()
 
 
-def _configure_env(monkeypatch, tmp_path) -> None:
+def _configure_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "publisher-token")
     monkeypatch.setenv("TELEGRAM_CHANNEL_ID", "@channel")
     monkeypatch.setenv("MODERATION_BOT_TOKEN", "moderation-token")
@@ -25,12 +26,10 @@ def _configure_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MODERATION_POLL_INTERVAL_SECONDS", "0.01")
     monkeypatch.setenv("MODERATION_POLL_TIMEOUT_SECONDS", "0")
     monkeypatch.setenv("PUBLISH_API_TOKEN", "secret-token")
-    monkeypatch.setenv("SCHEDULER_DB_PATH", str(tmp_path / "scheduled.sqlite3"))
+    monkeypatch.setenv("SCHEDULER_DB_PATH", str(tmp_path / "runtime.sqlite3"))
     monkeypatch.setenv("SCHEDULER_POLL_INTERVAL_SECONDS", "0.05")
     monkeypatch.setenv("SCHEDULER_RETRY_DELAY_SECONDS", "0.05")
-    articles_root = tmp_path / "publications"
-    articles_root.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("ARTICLES_ROOT_PATH", str(articles_root))
+    monkeypatch.setenv("SCHEDULER_MAX_ATTEMPTS", "2")
     _reset_settings()
 
 
@@ -101,38 +100,47 @@ def _wait_until(predicate, timeout: float = 3.0):
     raise AssertionError("Timed out waiting for condition.")
 
 
-def _load_draft(client: TestClient, draft_id: str) -> dict:
-    return client.get(
-        f"/drafts/{draft_id}",
-        headers={"Authorization": "Bearer secret-token"},
-    ).json()
+def _auth_headers() -> dict[str, str]:
+    return {"Authorization": "Bearer secret-token"}
 
 
 def _load_article(client: TestClient, article_id: str) -> dict:
-    return client.get(
-        f"/articles/{article_id}",
-        headers={"Authorization": "Bearer secret-token"},
-    ).json()
+    return client.get(f"/articles/{article_id}", headers=_auth_headers()).json()
+
+
+def _load_draft(client: TestClient, draft_id: str) -> dict:
+    return client.get(f"/drafts/{draft_id}", headers=_auth_headers()).json()
 
 
 def _load_scheduled_post(client: TestClient, post_id: str) -> dict:
-    return client.get(
-        f"/schedule/{post_id}",
-        headers={"Authorization": "Bearer secret-token"},
-    ).json()
+    return client.get(f"/schedule/{post_id}", headers=_auth_headers()).json()
 
 
-def _write_article(
-    root: Path,
+def _article_snapshot(
     *,
-    publication: str = "InComedy",
+    article_id: str | None = None,
+    title: str = "Новая статья",
     slug: str = "new-article",
-    body: str = "# Новая статья\n\nСодержимое статьи для ревью.\n",
-) -> Path:
-    path = root / publication / "articles" / f"{slug}.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    return path
+    markdown: str = "# Новая статья\n\nТекст статьи.\n",
+    text: str | None = None,
+    moderation_comment: str | None = None,
+) -> dict:
+    return {
+        "article_id": article_id,
+        "title": title,
+        "slug": slug,
+        "markdown": markdown,
+        "cover_path": "publications/InComedy/post-assets/new-article-cover.png",
+        "payload_path": ".codex-local/payloads/new-article.json",
+        "source_refs": ["https://example.com/spec"],
+        "attached_links": ["https://example.com/pr/1"],
+        "moderation_comment": moderation_comment,
+        "payload": {
+            "text": text or title,
+            "parse_mode": "HTML",
+            "link_style": "buttons",
+        },
+    }
 
 
 def test_health_endpoint(monkeypatch, tmp_path) -> None:
@@ -162,64 +170,110 @@ def test_publish_requires_bearer_token(monkeypatch, tmp_path) -> None:
     _reset_settings()
 
 
-def test_publish_dry_run_with_buttons(monkeypatch, tmp_path) -> None:
+def test_article_dry_run_without_article_id_creates_record(monkeypatch, tmp_path) -> None:
     _configure_env(monkeypatch, tmp_path)
     _stub_moderation_transport(monkeypatch)
 
     with TestClient(app) as client:
         response = client.post(
-            "/publish",
-            headers={"Authorization": "Bearer secret-token"},
-            json={
-                "text": "<b>Тест</b>",
-                "parse_mode": "HTML",
-                "dry_run": True,
-                "links": [
-                    {
-                        "title": "Репозиторий",
-                        "url": "https://github.com/example/project",
-                    }
-                ],
-            },
+            "/articles/dry-run",
+            headers=_auth_headers(),
+            json=_article_snapshot(),
         )
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["ok"] is True
-    assert payload["strategy"] == "message"
-    assert payload["actions"][0]["method"] == "sendMessage"
-    assert payload["actions"][0]["payload"]["reply_markup"]["inline_keyboard"][0][0]["text"] == (
-        "Репозиторий"
-    )
+        assert response.status_code == 200
+        payload = response.json()
+        article_id = payload["article"]["article_id"]
+        assert article_id
+        assert payload["article"]["status"] == "draft"
+        assert payload["article"]["publish_strategy"] == "message"
+        fetched = _load_article(client, article_id)
+
+    assert fetched["article_id"] == article_id
+    assert fetched["title"] == "Новая статья"
     _reset_settings()
 
 
-def test_publish_dry_run_media_group(monkeypatch, tmp_path) -> None:
+def test_article_dry_run_with_existing_article_id_updates_snapshot(monkeypatch, tmp_path) -> None:
     _configure_env(monkeypatch, tmp_path)
     _stub_moderation_transport(monkeypatch)
 
     with TestClient(app) as client:
-        response = client.post(
-            "/publish",
-            headers={"Authorization": "Bearer secret-token"},
-            json={
-                "text": "Пост с картинками",
-                "dry_run": True,
-                "images": [
-                    {"url": "https://example.com/1.png"},
-                    {"url": "https://example.com/2.png"},
-                ],
-            },
+        first = client.post(
+            "/articles/dry-run",
+            headers=_auth_headers(),
+            json=_article_snapshot(title="Первая версия", text="Первая версия"),
+        ).json()
+        article_id = first["article"]["article_id"]
+
+        second = client.post(
+            "/articles/dry-run",
+            headers=_auth_headers(),
+            json=_article_snapshot(
+                article_id=article_id,
+                title="Вторая версия",
+                text="Вторая версия",
+                markdown="# Вторая версия\n\nОбновленный текст.\n",
+            ),
         )
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["strategy"] == "media-group"
-    assert payload["actions"][0]["method"] == "sendMediaGroup"
+        assert second.status_code == 200
+        payload = second.json()
+        fetched = _load_article(client, article_id)
+
+    assert payload["article"]["article_id"] == article_id
+    assert fetched["title"] == "Вторая версия"
+    assert fetched["payload"]["text"] == "Вторая версия"
     _reset_settings()
 
 
-def test_submit_draft_creates_pending_review(monkeypatch, tmp_path) -> None:
+def test_submit_endpoint_creates_article_record_and_pending_review(monkeypatch, tmp_path) -> None:
+    _configure_env(monkeypatch, tmp_path)
+    transport = _stub_moderation_transport(monkeypatch)
+    publish_calls: list[dict] = []
+
+    async def fake_publish(self, request):
+        publish_calls.append(
+            {
+                "default_chat_id": self._default_chat_id,
+                "request_chat_id": request.chat_id,
+                "text": request.text,
+                "dry_run": request.dry_run,
+            }
+        )
+        return {
+            "ok": True,
+            "strategy": "message",
+            "rendered_text": request.text,
+            "actions": [{"method": "sendMessage", "payload": {"text": request.text}}],
+            "telegram_results": [],
+        }
+
+    monkeypatch.setattr(TelegramPublisher, "publish", fake_publish)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/articles/submit",
+            headers=_auth_headers(),
+            json=_article_snapshot(),
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        article_id = payload["article"]["article_id"]
+        draft_id = payload["draft"]["id"]
+        article = _load_article(client, article_id)
+        draft = _load_draft(client, draft_id)
+
+    assert article["status"] == "pending_review"
+    assert article["current_draft_id"] == draft_id
+    assert draft["article_id"] == article_id
+    assert publish_calls[0]["default_chat_id"] == "-100900"
+    assert transport["sent_messages"][0]["chat_id"] == "-100900"
+    _reset_settings()
+
+
+def test_publish_now_updates_article_by_stable_article_id(monkeypatch, tmp_path) -> None:
     _configure_env(monkeypatch, tmp_path)
     transport = _stub_moderation_transport(monkeypatch)
     publish_calls: list[dict] = []
@@ -243,67 +297,13 @@ def test_submit_draft_creates_pending_review(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(TelegramPublisher, "publish", fake_publish)
 
     with TestClient(app) as client:
-        response = client.post(
-            "/drafts",
-            headers={"Authorization": "Bearer secret-token"},
-            json={"text": "Новая статья"},
-        )
-
-        assert response.status_code == 200
-        created = response.json()
-        assert created["status"] == "pending_review"
-
-        list_response = client.get(
-            "/drafts",
-            headers={"Authorization": "Bearer secret-token"},
-        )
-
-    assert list_response.status_code == 200
-    drafts = list_response.json()
-    assert len(drafts) == 1
-    assert drafts[0]["id"] == created["id"]
-    assert publish_calls[0]["default_chat_id"] == "-100900"
-    assert transport["sent_messages"][0]["chat_id"] == "-100900"
-    keyboard = transport["sent_messages"][0]["reply_markup"]["inline_keyboard"]
-    assert keyboard[0][0]["text"] == "Опубликовать сейчас"
-    _reset_settings()
-
-
-def test_moderation_callback_publishes_to_channel(monkeypatch, tmp_path) -> None:
-    _configure_env(monkeypatch, tmp_path)
-    transport = _stub_moderation_transport(monkeypatch)
-    publish_calls: list[dict] = []
-
-    async def fake_publish(self, request):
-        publish_calls.append(
-            {
-                "default_chat_id": self._default_chat_id,
-                "request_chat_id": request.chat_id,
-                "text": request.text,
-            }
-        )
-        return {
-            "ok": True,
-            "strategy": "message",
-            "rendered_text": request.text,
-            "actions": [
-                {
-                    "method": "sendMessage",
-                    "payload": {"chat_id": self._default_chat_id, "text": request.text},
-                }
-            ],
-            "telegram_results": [],
-        }
-
-    monkeypatch.setattr(TelegramPublisher, "publish", fake_publish)
-
-    with TestClient(app) as client:
         created = client.post(
-            "/drafts",
-            headers={"Authorization": "Bearer secret-token"},
-            json={"text": "Статья для публикации"},
+            "/articles/submit",
+            headers=_auth_headers(),
+            json=_article_snapshot(),
         ).json()
-        draft_id = created["id"]
+        article_id = created["article"]["article_id"]
+        draft_id = created["draft"]["id"]
 
         transport["updates_queue"].append(
             {
@@ -317,23 +317,21 @@ def test_moderation_callback_publishes_to_channel(monkeypatch, tmp_path) -> None
             }
         )
 
-        def published_draft() -> dict | None:
-            draft = _load_draft(client, draft_id)
-            if draft["status"] == "published":
-                return draft
-            return None
+        article = _wait_until(
+            lambda: current
+            if (current := _load_article(client, article_id))["status"] == "published"
+            else None
+        )
 
-        published = _wait_until(published_draft)
-
-    assert published["status"] == "published"
+    assert article["article_id"] == article_id
+    assert article["status"] == "published"
     assert publish_calls[0]["default_chat_id"] == "-100900"
-    assert publish_calls[1]["default_chat_id"] == "@channel"
+    assert publish_calls[-1]["default_chat_id"] == "@channel"
     assert transport["callback_answers"][-1]["text"] == "Опубликовано в основной канал."
-    assert "Статус: <b>опубликован</b>" in transport["edited_messages"][-1]["text"]
     _reset_settings()
 
 
-def test_moderation_schedule_and_scheduler_publish(monkeypatch, tmp_path) -> None:
+def test_schedule_and_subsequent_publication(monkeypatch, tmp_path) -> None:
     _configure_env(monkeypatch, tmp_path)
     transport = _stub_moderation_transport(monkeypatch)
     publish_calls: list[dict] = []
@@ -358,11 +356,12 @@ def test_moderation_schedule_and_scheduler_publish(monkeypatch, tmp_path) -> Non
 
     with TestClient(app) as client:
         created = client.post(
-            "/drafts",
-            headers={"Authorization": "Bearer secret-token"},
-            json={"text": "Запланированная статья"},
+            "/articles/submit",
+            headers=_auth_headers(),
+            json=_article_snapshot(title="Запланированная статья", text="Запланированная статья"),
         ).json()
-        draft_id = created["id"]
+        article_id = created["article"]["article_id"]
+        draft_id = created["draft"]["id"]
 
         transport["updates_queue"].append(
             {
@@ -376,14 +375,11 @@ def test_moderation_schedule_and_scheduler_publish(monkeypatch, tmp_path) -> Non
             }
         )
 
-        def awaiting_schedule_draft() -> dict | None:
-            draft = _load_draft(client, draft_id)
-            if draft["status"] == "awaiting_schedule":
-                return draft
-            return None
-
-        awaiting_schedule = _wait_until(awaiting_schedule_draft)
-        assert awaiting_schedule["status"] == "awaiting_schedule"
+        _wait_until(
+            lambda: current
+            if (current := _load_article(client, article_id))["status"] == "awaiting_schedule"
+            else None
+        )
 
         future_local = (
             datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(seconds=1)
@@ -400,157 +396,31 @@ def test_moderation_schedule_and_scheduler_publish(monkeypatch, tmp_path) -> Non
             }
         )
 
-        def scheduled_draft() -> dict | None:
-            draft = _load_draft(client, draft_id)
-            if draft["status"] == "scheduled":
-                return draft
-            return None
+        scheduled = _wait_until(
+            lambda: current
+            if (current := _load_article(client, article_id))["status"] == "scheduled"
+            else None
+        )
+        scheduled_post_id = _load_draft(client, draft_id)["scheduled_post_id"]
+        assert scheduled_post_id
 
-        scheduled = _wait_until(scheduled_draft)
-        assert scheduled["scheduled_post_id"]
+        published = _wait_until(
+            lambda: current
+            if (current := _load_article(client, article_id))["status"] == "published"
+            else None,
+            timeout=4.0,
+        )
+        scheduled_post = _load_scheduled_post(client, scheduled_post_id)
 
-        def published_draft() -> dict | None:
-            draft = _load_draft(client, draft_id)
-            if draft["status"] == "published":
-                return draft
-            return None
-
-        published = _wait_until(published_draft, timeout=4.0)
-
+    assert scheduled["status"] == "scheduled"
     assert published["status"] == "published"
+    assert scheduled_post["status"] == "published"
     assert publish_calls[0]["default_chat_id"] == "-100900"
     assert publish_calls[-1]["default_chat_id"] == "@channel"
-    assert "Статус: <b>запланирован</b>" in transport["edited_messages"][-2]["text"]
-    assert "Статус: <b>опубликован</b>" in transport["edited_messages"][-1]["text"]
     _reset_settings()
 
 
-def test_schedule_post_and_list(monkeypatch, tmp_path) -> None:
-    _configure_env(monkeypatch, tmp_path)
-    _stub_moderation_transport(monkeypatch)
-
-    publish_at = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
-
-    with TestClient(app) as client:
-        create_response = client.post(
-            "/schedule",
-            headers={"Authorization": "Bearer secret-token"},
-            json={
-                "text": "Отложенный пост",
-                "publish_at": publish_at,
-            },
-        )
-
-        assert create_response.status_code == 200
-        created = create_response.json()
-        assert created["status"] == "pending"
-        assert created["request"]["text"] == "Отложенный пост"
-
-        list_response = client.get(
-            "/schedule",
-            headers={"Authorization": "Bearer secret-token"},
-        )
-
-    assert list_response.status_code == 200
-    scheduled_posts = list_response.json()
-    assert len(scheduled_posts) == 1
-    assert scheduled_posts[0]["id"] == created["id"]
-    _reset_settings()
-
-
-def test_scheduler_publishes_due_post(monkeypatch, tmp_path) -> None:
-    _configure_env(monkeypatch, tmp_path)
-    _stub_moderation_transport(monkeypatch)
-
-    async def fake_publish(self, request):
-        return {
-            "ok": True,
-            "strategy": "message",
-            "rendered_text": request.text,
-            "actions": [{"method": "sendMessage", "payload": {"text": request.text}}],
-            "telegram_results": [],
-        }
-
-    monkeypatch.setattr(TelegramPublisher, "publish", fake_publish)
-
-    publish_at = (datetime.now(UTC) + timedelta(milliseconds=100)).isoformat()
-
-    with TestClient(app) as client:
-        create_response = client.post(
-            "/schedule",
-            headers={"Authorization": "Bearer secret-token"},
-            json={
-                "text": "Нужно отправить позже",
-                "publish_at": publish_at,
-            },
-        )
-        assert create_response.status_code == 200
-        post_id = create_response.json()["id"]
-
-        def published_post() -> dict | None:
-            post = _load_scheduled_post(client, post_id)
-            if post["status"] == "published":
-                return post
-            return None
-
-        current = _wait_until(published_post)
-
-    assert current["status"] == "published"
-    assert current["attempts"] == 1
-    assert current["last_result"]["strategy"] == "message"
-    _reset_settings()
-
-
-def test_startup_sync_submits_articles_from_docs(monkeypatch, tmp_path) -> None:
-    _configure_env(monkeypatch, tmp_path)
-    transport = _stub_moderation_transport(monkeypatch)
-    publish_calls: list[dict] = []
-
-    async def fake_publish(self, request):
-        publish_calls.append(
-            {
-                "default_chat_id": self._default_chat_id,
-                "request_chat_id": request.chat_id,
-                "text": request.text,
-            }
-        )
-        return {
-            "ok": True,
-            "strategy": "message",
-            "rendered_text": request.text,
-            "actions": [{"method": "sendMessage", "payload": {"text": request.text}}],
-            "telegram_results": [],
-        }
-
-    monkeypatch.setattr(TelegramPublisher, "publish", fake_publish)
-    _write_article(
-        tmp_path / "publications",
-        slug="new-article",
-        body="# Новая статья\n\nСодержимое статьи для ревью.\n",
-    )
-
-    with TestClient(app) as client:
-        articles = client.get(
-            "/articles",
-            headers={"Authorization": "Bearer secret-token"},
-        ).json()
-        drafts = client.get(
-            "/drafts",
-            headers={"Authorization": "Bearer secret-token"},
-        ).json()
-
-    assert len(articles) == 1
-    assert len(drafts) == 1
-    assert articles[0]["status"] == "pending_review"
-    assert articles[0]["current_draft_id"] == drafts[0]["id"]
-    assert drafts[0]["article_id"] == articles[0]["id"]
-    assert drafts[0]["article_attempt"] == 1
-    assert publish_calls[0]["default_chat_id"] == "-100900"
-    assert "Статья:" in transport["sent_messages"][0]["text"]
-    _reset_settings()
-
-
-def test_article_rejection_comment_is_saved(monkeypatch, tmp_path) -> None:
+def test_reject_saves_comment_and_updates_article(monkeypatch, tmp_path) -> None:
     _configure_env(monkeypatch, tmp_path)
     transport = _stub_moderation_transport(monkeypatch)
 
@@ -564,18 +434,15 @@ def test_article_rejection_comment_is_saved(monkeypatch, tmp_path) -> None:
         }
 
     monkeypatch.setattr(TelegramPublisher, "publish", fake_publish)
-    _write_article(
-        tmp_path / "publications",
-        slug="rejected-article",
-        body="# Статья\n\nстарый текст\n",
-    )
 
     with TestClient(app) as client:
-        article = client.get(
-            "/articles",
-            headers={"Authorization": "Bearer secret-token"},
-        ).json()[0]
-        draft_id = article["current_draft_id"]
+        created = client.post(
+            "/articles/submit",
+            headers=_auth_headers(),
+            json=_article_snapshot(title="Статья", text="Статья"),
+        ).json()
+        article_id = created["article"]["article_id"]
+        draft_id = created["draft"]["id"]
 
         transport["updates_queue"].append(
             {
@@ -589,13 +456,11 @@ def test_article_rejection_comment_is_saved(monkeypatch, tmp_path) -> None:
             }
         )
 
-        def awaiting_rejection_comment() -> dict | None:
-            draft = _load_draft(client, draft_id)
-            if draft["status"] == "awaiting_rejection_comment":
-                return draft
-            return None
-
-        _wait_until(awaiting_rejection_comment)
+        _wait_until(
+            lambda: current
+            if (current := _load_draft(client, draft_id))["status"] == "awaiting_rejection_comment"
+            else None
+        )
 
         transport["updates_queue"].append(
             {
@@ -604,48 +469,36 @@ def test_article_rejection_comment_is_saved(monkeypatch, tmp_path) -> None:
                     "message_id": 200,
                     "chat": {"id": -100900},
                     "from": {"id": 777},
-                    "text": "replace: старый текст => новый текст",
+                    "text": "Нужно сильнее сократить вводный абзац",
                 },
             }
         )
 
-        def rejected_draft() -> dict | None:
-            draft = _load_draft(client, draft_id)
-            if draft["status"] == "rejected":
-                return draft
-            return None
-
-        _wait_until(rejected_draft)
+        article = _wait_until(
+            lambda: current
+            if (current := _load_article(client, article_id))["status"] == "rejected"
+            else None
+        )
         draft_comments = client.get(
             f"/drafts/{draft_id}/comments",
-            headers={"Authorization": "Bearer secret-token"},
+            headers=_auth_headers(),
         ).json()
         article_comments = client.get(
-            f"/articles/{article['id']}/comments",
-            headers={"Authorization": "Bearer secret-token"},
+            f"/articles/{article_id}/comments",
+            headers=_auth_headers(),
         ).json()
 
-    assert transport["callback_answers"][-1]["text"] == "Пришлите комментарий к отклонению сообщением."
-    assert len(draft_comments) == 1
-    assert len(article_comments) == 1
-    assert draft_comments[0]["body"] == "replace: старый текст => новый текст"
-    assert draft_comments[0]["id"] == article_comments[0]["id"]
+    assert article["moderation_comment"] == "Нужно сильнее сократить вводный абзац"
+    assert draft_comments[0]["body"] == "Нужно сильнее сократить вводный абзац"
+    assert article_comments[0]["id"] == draft_comments[0]["id"]
     _reset_settings()
 
 
-def test_rejected_article_is_revised_and_resubmitted_on_restart(monkeypatch, tmp_path) -> None:
+def test_restart_preserves_article_snapshot_and_scheduled_publish(monkeypatch, tmp_path) -> None:
     _configure_env(monkeypatch, tmp_path)
     transport = _stub_moderation_transport(monkeypatch)
-    publish_calls: list[dict] = []
 
     async def fake_publish(self, request):
-        publish_calls.append(
-            {
-                "default_chat_id": self._default_chat_id,
-                "request_chat_id": request.chat_id,
-                "text": request.text,
-            }
-        )
         return {
             "ok": True,
             "strategy": "message",
@@ -655,19 +508,126 @@ def test_rejected_article_is_revised_and_resubmitted_on_restart(monkeypatch, tmp
         }
 
     monkeypatch.setattr(TelegramPublisher, "publish", fake_publish)
-    article_path = _write_article(
-        tmp_path / "publications",
-        slug="restart-article",
-        body="# Статья\n\nстарый текст\n",
-    )
 
     with TestClient(app) as client:
-        article = client.get(
-            "/articles",
-            headers={"Authorization": "Bearer secret-token"},
-        ).json()[0]
-        article_id = article["id"]
-        first_draft_id = article["current_draft_id"]
+        dry_run = client.post(
+            "/articles/dry-run",
+            headers=_auth_headers(),
+            json=_article_snapshot(title="Переживет рестарт", text="Переживет рестарт"),
+        ).json()
+        article_id = dry_run["article"]["article_id"]
+        created = client.post(
+            "/articles/submit",
+            headers=_auth_headers(),
+            json=_article_snapshot(
+                article_id=article_id,
+                title="Переживет рестарт",
+                text="Переживет рестарт",
+            ),
+        ).json()
+        draft_id = created["draft"]["id"]
+
+        transport["updates_queue"].append(
+            {
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cb-1",
+                    "from": {"id": 777},
+                    "data": f"draft:schedule:{draft_id}",
+                    "message": {"message_id": 100, "chat": {"id": -100900}},
+                },
+            }
+        )
+        _wait_until(
+            lambda: current
+            if (current := _load_draft(client, draft_id))["status"] == "awaiting_schedule"
+            else None
+        )
+        future_local = (
+            datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(seconds=1)
+        ).isoformat()
+        transport["updates_queue"].append(
+            {
+                "update_id": 2,
+                "message": {
+                    "message_id": 200,
+                    "chat": {"id": -100900},
+                    "from": {"id": 777},
+                    "text": future_local,
+                },
+            }
+        )
+        scheduled_post_id = _wait_until(
+            lambda: current
+            if (current := _load_draft(client, draft_id))["status"] == "scheduled"
+            else None
+        )["scheduled_post_id"]
+
+    transport = _stub_moderation_transport(monkeypatch)
+
+    with TestClient(app) as client:
+        article_after_restart = _load_article(client, article_id)
+        assert article_after_restart["markdown"] == "# Новая статья\n\nТекст статьи.\n"
+        assert article_after_restart["payload"]["text"] == "Переживет рестарт"
+        published = _wait_until(
+            lambda: current
+            if (current := _load_article(client, article_id))["status"] == "published"
+            else None,
+            timeout=4.0,
+        )
+        scheduled_post = _load_scheduled_post(client, scheduled_post_id)
+
+    assert published["status"] == "published"
+    assert scheduled_post["status"] == "published"
+    _reset_settings()
+
+
+def test_server_does_not_auto_scan_local_articles_on_startup(monkeypatch, tmp_path) -> None:
+    _configure_env(monkeypatch, tmp_path)
+    _stub_moderation_transport(monkeypatch)
+
+    legacy_article = tmp_path / "publications" / "InComedy" / "articles" / "legacy.md"
+    legacy_article.parent.mkdir(parents=True, exist_ok=True)
+    legacy_article.write_text("# Legacy\n\nНе должно автоотправиться.\n", encoding="utf-8")
+
+    with TestClient(app) as client:
+        articles = client.get("/articles", headers=_auth_headers()).json()
+        drafts = client.get("/drafts", headers=_auth_headers()).json()
+
+    assert articles == []
+    assert drafts == []
+    _reset_settings()
+
+
+def test_resubmitting_updated_article_uses_same_article_id(monkeypatch, tmp_path) -> None:
+    _configure_env(monkeypatch, tmp_path)
+    transport = _stub_moderation_transport(monkeypatch)
+
+    async def fake_publish(self, request):
+        return {
+            "ok": True,
+            "strategy": "message",
+            "rendered_text": request.text,
+            "actions": [{"method": "sendMessage", "payload": {"text": request.text}}],
+            "telegram_results": [],
+        }
+
+    monkeypatch.setattr(TelegramPublisher, "publish", fake_publish)
+
+    with TestClient(app) as client:
+        dry_run = client.post(
+            "/articles/dry-run",
+            headers=_auth_headers(),
+            json=_article_snapshot(title="Первая", text="Первая"),
+        ).json()
+        article_id = dry_run["article"]["article_id"]
+
+        first_submit = client.post(
+            "/articles/submit",
+            headers=_auth_headers(),
+            json=_article_snapshot(article_id=article_id, title="Первая", text="Первая"),
+        ).json()
+        first_draft_id = first_submit["draft"]["id"]
 
         transport["updates_queue"].append(
             {
@@ -680,9 +640,11 @@ def test_rejected_article_is_revised_and_resubmitted_on_restart(monkeypatch, tmp
                 },
             }
         )
-
-        _wait_until(lambda: _load_draft(client, first_draft_id)["status"] == "awaiting_rejection_comment")
-
+        _wait_until(
+            lambda: current
+            if (current := _load_draft(client, first_draft_id))["status"] == "awaiting_rejection_comment"
+            else None
+        )
         transport["updates_queue"].append(
             {
                 "update_id": 2,
@@ -690,36 +652,113 @@ def test_rejected_article_is_revised_and_resubmitted_on_restart(monkeypatch, tmp
                     "message_id": 200,
                     "chat": {"id": -100900},
                     "from": {"id": 777},
-                    "text": "replace: старый текст => новый текст",
+                    "text": "Нужен новый ракурс",
                 },
             }
         )
+        _wait_until(
+            lambda: current
+            if (current := _load_article(client, article_id))["status"] == "rejected"
+            else None
+        )
 
-        _wait_until(lambda: _load_draft(client, first_draft_id)["status"] == "rejected")
-
-    transport = _stub_moderation_transport(monkeypatch)
-
-    with TestClient(app) as client:
-        def resubmitted_article() -> dict | None:
-            current = _load_article(client, article_id)
-            if current["status"] == "pending_review" and current["current_draft_id"] != first_draft_id:
-                return current
-            return None
-
-        current_article = _wait_until(resubmitted_article)
-        drafts = client.get(
-            "/drafts",
-            headers={"Authorization": "Bearer secret-token"},
+        client.post(
+            "/articles/dry-run",
+            headers=_auth_headers(),
+            json=_article_snapshot(
+                article_id=article_id,
+                title="Вторая",
+                text="Вторая",
+                markdown="# Вторая\n\nОбновленный текст.\n",
+                moderation_comment="Нужен новый ракурс",
+            ),
+        )
+        second_submit = client.post(
+            "/articles/submit",
+            headers=_auth_headers(),
+            json=_article_snapshot(
+                article_id=article_id,
+                title="Вторая",
+                text="Вторая",
+                markdown="# Вторая\n\nОбновленный текст.\n",
+                moderation_comment="Нужен новый ракурс",
+            ),
         ).json()
-        comments = client.get(
-            f"/articles/{article_id}/comments",
-            headers={"Authorization": "Bearer secret-token"},
-        ).json()
+        drafts = client.get("/drafts", headers=_auth_headers()).json()
+        article = _load_article(client, article_id)
 
-    assert current_article["current_draft_id"] != first_draft_id
+    assert second_submit["article"]["article_id"] == article_id
+    assert article["title"] == "Вторая"
+    assert article["status"] == "pending_review"
     assert len(drafts) == 2
-    assert comments[0]["applied_at"] is not None
-    assert "новый текст" in article_path.read_text(encoding="utf-8")
-    assert "новый текст" in publish_calls[-1]["text"]
-    assert transport["sent_messages"][0]["chat_id"] == "-100900"
+    assert all(draft["article_id"] == article_id for draft in drafts)
     _reset_settings()
+
+
+def test_local_active_archive_index_workflow(tmp_path) -> None:
+    repo = LocalArticleRepository(tmp_path / "publications" / "InComedy")
+    now = datetime.now(UTC)
+    article = LocalArticleDocument(
+        article_id=None,
+        status="draft",
+        created_at=now,
+        updated_at=now,
+        scheduled_publish_at=None,
+        moderation_comment=None,
+        title="Локальная статья",
+        slug="local-article",
+        cover_path="publications/InComedy/post-assets/local-article.png",
+        payload_path=".codex-local/payloads/local-article.json",
+        source_refs=["https://example.com/spec"],
+        attached_links=["https://example.com/pr/1"],
+        last_synced_at=None,
+        publish_strategy=None,
+        last_error=None,
+        body="# Локальная статья\n\nТекст.\n",
+    )
+
+    path = repo.save_article(article)
+    index = repo.read_index()
+    cards = repo.list_active_cards()
+    loaded = repo.load_article(path)
+
+    assert path == tmp_path / "publications" / "InComedy" / "articles" / "active" / "local-article.md"
+    assert index["active"][0]["slug"] == "local-article"
+    assert index["archive"] == []
+    assert cards[0].path == "publications/InComedy/articles/active/local-article.md"
+    assert loaded.title == "Локальная статья"
+
+
+def test_published_local_article_moves_to_archive_and_leaves_active_manifest(tmp_path) -> None:
+    repo = LocalArticleRepository(tmp_path / "publications" / "InComedy")
+    now = datetime.now(UTC)
+    active_path = repo.save_article(
+        LocalArticleDocument(
+            article_id="article-123",
+            status="published",
+            created_at=now,
+            updated_at=now,
+            scheduled_publish_at=None,
+            moderation_comment=None,
+            title="Архивируемая статья",
+            slug="archived-article",
+            cover_path="publications/InComedy/post-assets/archived-article.png",
+            payload_path=".codex-local/payloads/archived-article.json",
+            source_refs=[],
+            attached_links=[],
+            last_synced_at=None,
+            publish_strategy="single-image",
+            last_error=None,
+            body="# Архивируемая статья\n\nТекст.\n",
+        )
+    )
+
+    archived_path = repo.archive_article(article_id="article-123")
+    index = repo.read_index()
+
+    assert active_path.exists() is False
+    assert archived_path == (
+        tmp_path / "publications" / "InComedy" / "articles" / "archive" / "archived-article.md"
+    )
+    assert index["active"] == []
+    assert index["archive"][0]["article_id"] == "article-123"

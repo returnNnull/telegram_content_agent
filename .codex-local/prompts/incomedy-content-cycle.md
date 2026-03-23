@@ -5,321 +5,203 @@
 - `/Users/abetirov/AndroidStudioProjects/InComedy`
 - `/Users/abetirov/projects/telegram-content-agent`
 
-Сделай один полный цикл контент-пайплайна по InComedy.
+Сделай один полный цикл article-centric контент-пайплайна по InComedy.
 
-## Цель
+## Режим исполнения
 
-- найти одну сильную техническую тему по реальным изменениям InComedy;
-- подготовить статью, Telegram-пост и обложку;
-- проверить материал;
-- сделать dry_run;
-- при успехе отправить draft в moderation flow через Telegram content agent;
-- обновить локальный учет;
-- не делать новую отправку, если прошлый хвост не разобран.
+- не пересказывай этот файл в ответе
+- следуй ему как runbook
+- локальная статья является primary source of truth
+- сначала всегда синхронизируй существующие активные статьи с сервером
+- новую тему выбирай только если незавершенных неопубликованных статей нет
+- не обходи moderation flow без явного основания
 
-Используй только реальные данные из diff, кода, `docs/context` и официальных источников. Ничего не выдумывай. Если тема слабая или материал сырой, пропусти цикл.
+## Рабочие каталоги
 
-## Критические правила
+- активные статьи: `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/articles/active`
+- архив статей: `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/articles/archive`
+- manifest: `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/articles/index.json`
+- обложки: `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/post-assets`
+- payload-артефакты: `/Users/abetirov/projects/telegram-content-agent/.codex-local/payloads`
 
-- штатный путь отправки: `POST /drafts`;
-- `dry_run` разрешен только через `POST /publish` с `dry_run=true`;
-- `POST /publish` без `dry_run` и `POST /schedule` используй только как bypass, если moderation flow недоступен, есть явное указание обойти его или нужна аварийная публикация;
-- отправка draft не равна публикации;
-- сервисный lifecycle статьи через `/articles` используй для наблюдения и синхронизации статусов, но не считай его заменой `POST /drafts` как trigger штатной отправки;
-- ориентируйся на текущий moderation chat из конфигурации сервиса;
-- новые статьи и новые обложки сохраняй только в:
-  - `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/articles`
-  - `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/post-assets`
-- legacy-каталоги используй только как архив и источник стиля:
-  - `/Users/abetirov/projects/telegram-content-agent/.codex-local/articles`
-  - `/Users/abetirov/projects/telegram-content-agent/.codex-local/post-assets`
-- не создавай новую отправку при любом блокирующем условии;
-- не обходи moderation flow без явного основания;
-- не считай отправку draft публикацией;
-- не записывай новые статьи или новые обложки в legacy-каталоги.
+Не используй `.codex-local/articles` как рабочее хранилище новой модели.
 
-## Файлы состояния
-
-- `/Users/abetirov/projects/telegram-content-agent/.codex-local/post-drafts.md`
-- `/Users/abetirov/projects/telegram-content-agent/.codex-local/publication-log.json`
-- `/Users/abetirov/projects/telegram-content-agent/.codex-local/payloads`
-- `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/articles`
-- `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/post-assets`
-
-## Разделение статусов
-
-Сервисные статусы статьи и draft-а:
+## Статусы статьи
 
 - `draft`
 - `pending_review`
 - `awaiting_schedule`
-- `awaiting_rejection_comment`
 - `scheduled`
-- `published`
 - `rejected`
+- `published`
 - `failed`
 
-Локальные статусы в `publication-log.json`:
+Внутренний server-side шаг ожидания комментария к отклонению не является внешним статусом статьи.
 
-- `prepared`
-- `pending_review`
-- `awaiting_schedule`
-- `awaiting_rejection_comment`
-- `scheduled`
-- `published`
-- `rejected`
-- `failed`
-- `skipped_no_material`
-- `skipped_quality`
-- `skipped_blocked`
-- `bypass_scheduled`
-- `bypass_published`
+## Формат локальной статьи
 
-Terminal-статусы для реально отправленных записей:
+Каждая локальная статья хранится одним markdown-файлом с YAML front matter.
 
-- `published`
-- `rejected`
+Минимальные поля:
 
-Важно:
+- `article_id`
+- `status`
+- `created_at`
+- `updated_at`
+- `scheduled_publish_at`
+- `moderation_comment`
+- `title`
+- `slug`
+- `cover_path`
+- `payload_path`
 
-- сервисный статус `draft` означает, что статья зарегистрирована локально, но еще не отправлена;
-- локальный статус `prepared` означает, что материал собран, но отправка еще не завершена;
-- `awaiting_rejection_comment` не является terminal-статусом и блокирует новый цикл;
-- если у записи есть `draft_id` или `schedule_id`, ее статус нужно синхронизировать через API, а не угадывать по локальному файлу.
+Допустимые дополнительные поля:
+
+- `source_refs`
+- `attached_links`
+- `last_synced_at`
+- `publish_strategy`
+- `last_error`
+
+Если `article_id` еще не выдан, он может быть `null`.
 
 ## Источники правил
 
-Перед работой обязательно прочитай:
+Перед работой прочитай:
 
-- `/Users/abetirov/projects/telegram-content-agent/.codex-local/post-drafts.md`
-- `/Users/abetirov/projects/telegram-content-agent/.codex-local/publication-log.json`
+- `/Users/abetirov/projects/telegram-content-agent/README.md`
+- `/Users/abetirov/projects/telegram-content-agent/docs/server.md`
 - `/Users/abetirov/projects/telegram-content-agent/docs/publication-rules.md`
 - `/Users/abetirov/projects/telegram-content-agent/docs/publishing-from-chat.md`
+- `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/articles/index.json`, если файл существует
 
-Если `publication-log.json` не существует, создай его как пустой JSON-массив `[]`.
+Если `index.json` отсутствует, создай его в формате:
+
+```json
+{
+  "active": [],
+  "archive": []
+}
+```
 
 ## Порядок работы
 
-### 1. Синхронизация существующего хвоста
+### 1. Синхронизация хвоста
 
-Сначала синхронизируй локальный учет с сервисом:
+Сначала:
 
-- для каждой записи с `draft_id` запроси актуальный статус через draft API:
-  - `GET /drafts/{draft_id}`
-  - если запись отклонена или ожидает комментарий, дополнительно запроси `GET /drafts/{draft_id}/comments`
-- для записи с `schedule_id` запроси актуальный статус через `GET /schedule/{schedule_id}`
-- если у записи известен `article_id`, при необходимости проверь `GET /articles/{article_id}` и `GET /articles/{article_id}/comments`
-- обнови `publication-log.json`
-- обнови `post-drafts.md`
+1. Прочитай `index.json`.
+2. Загрузи только карточки из `active`.
+3. Открой только active-статьи, которые есть в manifest.
+4. Для каждой статьи с `article_id` запроси `GET /articles/{article_id}`.
+5. Для статей в `rejected` дополнительно запроси `GET /articles/{article_id}/comments`.
 
-Если хотя бы один статус не удалось получить из-за API, сети, авторизации или недоступности сервиса:
+Правила:
 
-- создай новую запись `skipped_blocked` с краткой причиной;
-- обнови `publication-log.json`;
-- добавь краткую запись в `post-drafts.md`;
-- останови цикл.
+- если статья на сервере в `pending_review`, `awaiting_schedule` или `scheduled`, обнови локальный front matter и не создавай новую тему
+- если статья в `published`, пометь локально как `published`, перенеси файл в `archive`, обнови `index.json`
+- если статья в `rejected`, сохрани актуальный комментарий в `moderation_comment`, переработай статью и продолжай работу с ней
+- если статья в `failed`, зафиксируй `last_error` и реши, можно ли безопасно продолжить
+- если `article_id` у статьи отсутствует, не пытайся синхронизировать ее по серверу; это локальный draft-кандидат
 
-### 2. Проверка неразобранного хвоста
+Не загружай весь архив в рабочий контекст.
 
-Проверь два типа хвоста.
+### 2. Блокировка нового цикла
 
-Локальный prepared-хвост:
+Если после синхронизации есть хотя бы одна статья в `draft`, `pending_review`, `awaiting_schedule`, `scheduled`, `rejected` или `failed`, сначала двигай именно ее.
 
-- найди последние записи со статусом `prepared`;
-- если у них нет `draft_id` и нет `schedule_id`, считай их неразобранным хвостом;
-- если такой хвост есть, создай `skipped_blocked`, зафиксируй причину и останови цикл.
+Особое правило:
 
-Telegram-хвост:
+- если статья `rejected`, reject обязан запускать локальную переработку статьи и повторный dry run
+- бросать rejected-статью и создавать новую тему запрещено
 
-- возьми две последние записи, которые реально отправлялись в Telegram flow или bypass;
-- если хотя бы одна из них имеет статус `failed`, создай `skipped_blocked` и останови цикл;
-- если хотя бы одна из них не находится в terminal-статусах `published` или `rejected`, создай `skipped_blocked` и останови цикл.
+### 3. Выбор новой темы
 
-### 3. Изучение материала в InComedy
+Только если активных незавершенных статей нет:
 
-Изучи релевантные изменения в `/Users/abetirov/AndroidStudioProjects/InComedy`:
+- изучи реальные изменения в `/Users/abetirov/AndroidStudioProjects/InComedy`
+- используй `git diff`, связанные коммиты, измененные файлы и `docs/context`
+- выбери ровно одну сильную техническую тему
+- если сильной темы нет, корректно остановись без новой статьи
 
-- `git diff`
-- связанные коммиты
-- измененные файлы
-- `docs/context`
-- особенно `product`, `engineering`, `governance`, `handoff`
+### 4. Создание локальной статьи
 
-Если сильной темы нет:
+Для новой статьи:
 
-- ничего не отправляй;
-- запиши `skipped_no_material` в `publication-log.json`;
-- добавь короткую запись в `post-drafts.md`;
-- останови цикл.
+- создай markdown-файл в `.../articles/active`
+- заполни front matter
+- `article_id` оставь `null`, если dry run еще не делался
+- обнови `index.json`
+- создай обложку в `publications/InComedy/post-assets`
+- подготовь payload в `.codex-local/payloads`
 
-### 4. Выбор темы
-
-Выбери ровно одну тему.
-
-Приоритет:
-
-- продуктовые и архитектурные решения;
-- сложные интеграции;
-- изменения, влияющие на дальнейшее развитие проекта;
-- реальные инженерные выводы.
-
-Запрещено:
-
-- собирать тему из россыпи мелких изменений;
-- брать тему без опоры на первоисточники;
-- писать материал, если он не выдерживает проверку по diff, коду и документам.
-
-### 5. Проверка стиля
-
-Сверь стиль по:
-
-- `/Users/abetirov/projects/telegram-content-agent/.codex-local/post-drafts.md`
-- `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/articles`
-- `/Users/abetirov/projects/telegram-content-agent/.codex-local/articles`
-
-Требования к стилю:
-
-- одна главная тема;
-- прямой русский язык;
-- минимум жаргона;
-- без длинных блоков кода;
-- акцент на механизм, решение, риски и выводы.
-
-### 6. Статья
-
-Создай статью в `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/articles`:
-
-- markdown;
-- нормальный заголовок и структура;
-- без больших блоков кода;
-- вместо кода давай ссылки на классы, методы, документы и официальные источники;
-- для внешних SDK, auth, платежей, интеграций и кабинетов провайдеров обязательно объясняй, где брать параметры, как использовать их в проекте и какие есть риски;
-- если тема распадается на Android и iOS, не смешивай их.
-
-### 7. Telegram-пост
-
-Подготовь Telegram-пост:
-
-- короткий сильный вывод, не пересказ статьи;
-- простой язык;
-- 1-3 внешние ссылки;
-- если пост задуман как одно сообщение с одной картинкой, текст обязан помещаться в caption;
-- если `link_style=text`, оставляй запас длины под URL.
-
-### 8. Обложка
-
-Сделай или обнови обложку в `/Users/abetirov/projects/telegram-content-agent/publications/InComedy/post-assets`:
-
-- `1200x675`;
-- чистая композиция;
-- абстрактный фон;
-- короткий сильный текст;
-- без схем, перегруза и артефактов.
-
-### 9. Три прохода редактуры
-
-До любой отправки сделай три прогона:
-
-- авторский черновик;
-- упрощение и усиление пользы;
-- редактура, сокращение, удаление AI-стиля.
-
-### 10. Payload
-
-Подготовь payload в `/Users/abetirov/projects/telegram-content-agent/.codex-local/payloads`.
-
-### 11. Dry run и пред-валидация
+### 5. Dry run
 
 Перед отправкой обязательно:
 
-- если нужна локальная картинка, скопируй ее на сервер;
-- сделай `dry_run` через `POST /publish` с `dry_run=true`;
-- проверь стратегию публикации;
-- если задуман single-message пост с одной картинкой, а `dry_run` показывает split, сократи текст и повтори `dry_run`;
-- если `dry_run` неуспешен, создай `skipped_quality` и останови цикл;
-- если не удается получить целостный single-message вариант для такого поста, создай `skipped_quality` и останови цикл.
+- сделай `POST /articles/dry-run`
+- если `article_id` отсутствовал, возьми его из ответа и сразу запиши в локальную статью
+- обнови `updated_at`, `last_synced_at`, `publish_strategy`, `last_error`
+- если single-image single-post разваливается на split, сократи текст и повтори dry run
+- если dry run неуспешен, не переходи к submit
 
-### 12. Минимальные условия отправки
+Dry run не должен запускать moderation flow.
 
-Не отправляй материал, если хотя бы одно условие не выполнено:
+### 6. Submit
 
-- тема сильная;
-- текст основан на diff, коде, документах и официальных источниках;
-- `dry_run` успешен;
-- пост не разваливается, если задуман одним сообщением;
-- приложены ключевые ссылки;
-- текст зрелый.
+После успешного dry run:
 
-### 13. Штатная отправка
+- вызови `POST /articles/submit` с тем же `article_id`
+- убедись, что статья получила `pending_review`
+- обнови локальный `status`, `updated_at`, `last_synced_at`
 
-Если все условия выполнены:
+### 7. Работа с reject
 
-- используй `POST /drafts`;
-- успешным результатом считай `pending_review`;
-- сохрани `draft_id`;
-- если API возвращает связанный `article_id`, сохрани и его;
-- после отправки запроси `GET /drafts/{draft_id}` и зафиксируй точный статус;
-- если есть сервисный `article_id`, запроси `GET /articles/{article_id}` и синхронизируй его статус;
-- обнови `publication-log.json`;
-- обнови `post-drafts.md`.
+Если статья отклонена:
 
-### 14. Bypass
+1. Прочитай последний комментарий модератора.
+2. Сохрани его в `moderation_comment`.
+3. Отредактируй локальный markdown.
+4. Снова сделай `POST /articles/dry-run` с тем же `article_id`.
+5. После успешного dry run снова вызови `POST /articles/submit` с тем же `article_id`.
 
-Используй bypass только при явном основании.
+Не создавай новый `slug` и не создавай новую статью поверх той же темы.
 
-Если используется `POST /schedule`:
+### 8. Работа с publish
 
-- ставь время `18:05-18:47 Europe/Moscow`;
-- `publish_at` должен быть в ISO 8601 с timezone;
-- если время на сегодня прошло, ставь на следующий день;
-- сохрани `schedule_id` и режим bypass.
+Если статья стала `published`:
 
-### 15. Что сохранять в publication-log
+- обнови локальный `status`
+- перенеси файл из `active` в `archive`
+- обнови `index.json`
+- archive не загружай в рабочий контекст целиком
 
-Для каждой новой записи сохраняй:
+## Минимальные требования к материалу
 
-- `slug`
-- `topic`
-- `article_path`
-- `cover_path`
-- `payload_path`
-- `source_refs`
-- `attached_links`
-- `publication_mode`
-- `draft_id`
-- `draft_status`
-- `article_id`
-- `article_status`
-- `schedule_id`
-- `publish_at`
-- `created_at`
-- `updated_at`
-- `failure_reason`
+- тема основана на реальных diff, коде и документах
+- статья и пост не выдумывают факты
+- есть сильный инженерный вывод
+- приложены ключевые ссылки
+- dry run пройден
+- отправка сделана только через article-centric flow
 
-Если запись была отклонена и сервис вернул комментарии:
+## Запрещено
 
-- сохрани краткую сводку комментария в `failure_reason` или notes-блок локального учета;
-- не скрывай факт отклонения;
-- не запускай новый цикл, пока reject-хвост не разобран и не доведен до terminal-состояния по локальным правилам.
+- считать сервер владельцем локального markdown
+- использовать статус-по-папке как главный механизм workflow
+- создавать новую тему при наличии незавершенной active-статьи
+- использовать `POST /drafts` как основной путь
+- обходить reject без локальной переработки статьи
+- переиспользовать legacy `prepared-tail` как отдельную полусущность вне article lifecycle
 
-### 16. Короткий финальный отчет
+## Короткий финальный отчет
 
 В конце дай короткий отчет:
 
-- какая тема выбрана;
-- на чем она основана;
-- создана ли статья;
-- подготовлен ли пост;
-- пройден ли `dry_run`;
-- отправлен ли draft;
-- какой текущий статус;
-- есть ли незавершенный хвост;
-- если цикл пропущен, почему.
-
-## Дополнительные ограничения
-
-- ничего не публикуй напрямую в канал без явного основания;
-- `pending_review` означает только успешную доставку в moderation flow;
-- если сервисный `/articles` lifecycle виден, используй его как дополнительный источник правды, но главным результатом штатной отправки считай `POST /drafts -> pending_review`;
-- если сервис недоступен, не придумывай статус, а явно фиксируй `skipped_blocked`;
-- не подменяй реальные первоисточники интерпретацией без ссылки на код, doc или официальный внешний источник.
+- какая статья была в работе
+- был ли sync с сервером
+- был ли dry run
+- был ли получен или сохранен `article_id`
+- была ли отправка в moderation flow
+- какой текущий статус статьи
+- была ли архивирована статья

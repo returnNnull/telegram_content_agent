@@ -21,10 +21,9 @@ ArticleStatus = Literal[
     "draft",
     "pending_review",
     "awaiting_schedule",
-    "awaiting_rejection_comment",
     "scheduled",
-    "published",
     "rejected",
+    "published",
     "failed",
 ]
 
@@ -72,8 +71,8 @@ class PublishResponse(BaseModel):
     ok: bool
     strategy: str
     rendered_text: str
-    actions: list[dict]
-    telegram_results: list[dict] = Field(default_factory=list)
+    actions: list[dict[str, Any]]
+    telegram_results: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SchedulePublishRequest(PublishRequest):
@@ -98,6 +97,35 @@ class SubmitDraftRequest(PublishRequest):
         return self
 
 
+class ArticleSnapshotRequest(BaseModel):
+    article_id: str | None = None
+    title: str = Field(min_length=1)
+    slug: str = Field(min_length=1)
+    markdown: str = Field(min_length=1)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    scheduled_publish_at: datetime | None = None
+    moderation_comment: str | None = None
+    cover_path: str | None = None
+    payload_path: str | None = None
+    source_refs: list[str] = Field(default_factory=list)
+    attached_links: list[str] = Field(default_factory=list)
+    last_synced_at: datetime | None = None
+    publish_strategy: str | None = None
+    last_error: str | None = None
+    payload: PublishRequest
+
+    @model_validator(mode="after")
+    def validate_article_request(self) -> "ArticleSnapshotRequest":
+        if self.scheduled_publish_at is not None:
+            if (
+                self.scheduled_publish_at.tzinfo is None
+                or self.scheduled_publish_at.utcoffset() is None
+            ):
+                raise ValueError("scheduled_publish_at must include timezone information.")
+        return self
+
+
 class ScheduledPostResponse(BaseModel):
     id: str
     status: ScheduledPostStatus
@@ -114,6 +142,7 @@ class ScheduledPostResponse(BaseModel):
 
 class ModerationDraftResponse(BaseModel):
     id: str
+    article_id: str | None = None
     status: ModerationDraftStatus
     created_at: datetime
     updated_at: datetime
@@ -124,25 +153,38 @@ class ModerationDraftResponse(BaseModel):
     last_error: str | None = None
     request: PublishRequest
     publication_result: dict[str, Any] | None = None
-    article_id: str | None = None
-    article_attempt: int | None = None
-    article_source_hash: str | None = None
 
 
 class ArticleResponse(BaseModel):
-    id: str
-    source_path: Path
-    publication: str
-    slug: str
-    title: str
+    article_id: str
     status: ArticleStatus
     created_at: datetime
     updated_at: datetime
-    current_source_hash: str
-    last_submitted_hash: str | None = None
-    current_draft_id: str | None = None
+    scheduled_publish_at: datetime | None = None
     published_at: datetime | None = None
+    moderation_comment: str | None = None
+    title: str
+    slug: str
+    cover_path: str | None = None
+    payload_path: str | None = None
+    source_refs: list[str] = Field(default_factory=list)
+    attached_links: list[str] = Field(default_factory=list)
+    last_synced_at: datetime | None = None
+    publish_strategy: str | None = None
     last_error: str | None = None
+    markdown: str
+    payload: PublishRequest
+    current_draft_id: str | None = None
+
+
+class ArticleDryRunResponse(BaseModel):
+    article: ArticleResponse
+    dry_run: PublishResponse
+
+
+class ArticleSubmitResponse(BaseModel):
+    article: ArticleResponse
+    draft: ModerationDraftResponse
 
 
 class ArticleCommentResponse(BaseModel):

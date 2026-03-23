@@ -1,212 +1,182 @@
 # telegram-content-agent
 
-Сервис для публикации Telegram-постов через review-группу и два Telegram-бота в одном FastAPI-процессе.
+Сервис для article-centric публикации статей в Telegram через review-группу и два Telegram-бота в одном FastAPI-процессе.
 
-## Актуальный flow
+## Актуальная модель
 
-1. При старте сервис сканирует `ARTICLES_ROOT_PATH/**/articles/*.md` и ищет статьи, которые еще не проходили модерацию.
-2. Для новой статьи создается `article` в SQLite и связанный moderation draft.
-3. `moderation bot` отправляет preview поста в `MODERATION_CHAT_ID` и отдельное control message.
-4. Модератор в review-группе выбирает `Опубликовать сейчас`, `Запланировать` или `Отклонить`.
-5. Для `Отклонить` бот запрашивает отдельный комментарий сообщением и сохраняет его в БД.
-6. На следующем старте сервис повторно проверяет отклоненные статьи:
-   - если markdown уже изменился вручную, статья отправляется повторно;
-   - если комментарий содержит поддерживаемые edit-инструкции, сервис применяет их к markdown и отправляет статью повторно.
-7. `publisher bot` публикует подтвержденный пост в `TELEGRAM_CHANNEL_ID` сразу или через scheduler.
+- Локальная статья всегда является primary source of truth.
+- Локальная статья хранится как один markdown-файл с YAML front matter.
+- До первого успешного dry run `article_id` может отсутствовать.
+- `POST /articles/dry-run` создает или обновляет server-side snapshot статьи и, если нужно, выдает новый `article_id`.
+- Агент обязан сразу сохранить выданный `article_id` обратно в локальный markdown.
+- `POST /articles/submit` отправляет в moderation flow тот же `article_id`.
+- Сервер хранит snapshot статьи и payload в SQLite и публикует подтвержденный или запланированный материал из БД, без повторного чтения локального markdown.
 
-Прямые `POST /publish` и `POST /schedule` оставлены как bypass для ручных, аварийных и технических сценариев.
+Сервер больше не сканирует `publications/**/articles/*.md` на старте и не инициирует lifecycle локальных статей сам.
 
-## Что есть в проекте
+## Локальная структура
 
-- FastAPI-сервер
-- publisher bot для основного канала
-- moderation bot для review-группы
-- long polling для обработки callback и ввода времени без webhook
-- SQLite для хранения draft-ов и отложенных публикаций
-- SQLite для хранения статей и комментариев модератора
-- startup-sync локальных markdown-статей из `publications`
-- scheduler с retry для отложенных постов
-- поддержка текста, ссылок, одной или нескольких картинок
-
-## Быстрый старт
-
-1. Создай `.env` по примеру [`.env.example`](/Users/abetirov/projects/telegram-content-agent/.env.example)
-2. Установи зависимости:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+```text
+publications/InComedy/articles/active
+publications/InComedy/articles/archive
+publications/InComedy/articles/index.json
+publications/InComedy/post-assets
+.codex-local/payloads
 ```
 
-3. Запусти сервер:
+Правила:
 
-```bash
-telegram-content-agent
+- в `active` лежат только статьи в работе со статусами `draft`, `pending_review`, `awaiting_schedule`, `scheduled`, `rejected`, `failed`
+- в `archive` лежат `published` и явно архивированные материалы
+- workflow-статус живет в YAML front matter, а не в названии папки
+- перемещение между `active` и `archive` делается только при архивировании
+- агент читает сначала `index.json`, затем только active-статьи
+
+## Формат локальной статьи
+
+Минимальный front matter:
+
+```yaml
+---
+article_id: null
+status: "draft"
+created_at: "2026-03-23T09:00:00+00:00"
+updated_at: "2026-03-23T09:00:00+00:00"
+scheduled_publish_at: null
+moderation_comment: null
+title: "Почему ticketing появился раньше выбора провайдера"
+slug: "ticketing-before-provider-choice"
+cover_path: "publications/InComedy/post-assets/ticketing_before_provider_cover.png"
+payload_path: ".codex-local/payloads/ticketing-before-provider-choice.json"
+source_refs:
+  - "https://example.com/spec"
+attached_links:
+  - "https://example.com/pr/1"
+last_synced_at: null
+publish_strategy: null
+last_error: null
+---
 ```
 
-Или так:
+`cover_path` и `payload_path` являются ссылками на артефакты, а не источником истины по статье.
 
-```bash
-uvicorn telegram_content_agent.main:app --host 0.0.0.0 --port 8000
-```
+## Статусы статьи
 
-## Переменные окружения
+- `draft`
+- `pending_review`
+- `awaiting_schedule`
+- `scheduled`
+- `rejected`
+- `published`
+- `failed`
 
-- `TELEGRAM_BOT_TOKEN` — токен publisher bot для основного канала
-- `TELEGRAM_CHANNEL_ID` — ID канала или `@channel_username`
-- `MODERATION_BOT_TOKEN` — токен moderation bot для review-чата
-- `MODERATION_CHAT_ID` — ID группы, где вы подтверждаете публикации
-- `MODERATION_TIMEZONE` — timezone для ввода времени в чате, по умолчанию `Europe/Moscow`
-- `MODERATION_ALLOWED_USER_IDS` — список Telegram user id через запятую; если пусто, модерировать может любой участник `MODERATION_CHAT_ID`
-- `MODERATION_POLL_INTERVAL_SECONDS` — пауза между циклами polling
-- `MODERATION_POLL_TIMEOUT_SECONDS` — timeout одного `getUpdates`
-- `PUBLISH_API_TOKEN` — bearer token для защищенных endpoint'ов
-- `TELEGRAM_API_BASE` — базовый URL Telegram Bot API
-- `REQUEST_TIMEOUT_SECONDS` — timeout HTTP-запросов к Telegram
-- `DEFAULT_PARSE_MODE` — сейчас поддержан `HTML` или пустое значение
-- `DEFAULT_LINK_STYLE` — `buttons` или `text`
-- `SCHEDULER_DB_PATH` — путь к SQLite-базе runtime-состояния
-- `SCHEDULER_POLL_INTERVAL_SECONDS` — как часто воркер проверяет due-задачи
-- `SCHEDULER_BATCH_SIZE` — сколько задач забирать за один цикл
-- `SCHEDULER_RETRY_DELAY_SECONDS` — задержка перед повторной попыткой
-- `SCHEDULER_MAX_ATTEMPTS` — максимум попыток отправки отложенного поста
-- `ARTICLES_ROOT_PATH` — корневая папка, где сервис ищет статьи в `**/articles/*.md`
-- `ARTICLES_AUTO_SYNC_ON_STARTUP` — включить startup-sync статей, по умолчанию `true`
-
-## Правила публикации
-
-- Для штатного сценария используйте `POST /drafts`, а не `POST /publish` или `POST /schedule`.
-- `POST /drafts` не поддерживает `dry_run`, а входной `chat_id` игнорирует.
-- Локальные статьи из `ARTICLES_ROOT_PATH/**/articles/*.md` автоматически отправляются на модерацию при старте, если у них еще нет успешной отправки.
-- Если задан `MODERATION_ALLOWED_USER_IDS`, модерировать могут только эти Telegram user id. Если список пустой, действовать может любой участник `MODERATION_CHAT_ID`.
-- После нажатия `Запланировать` время должен прислать отдельным сообщением тот же модератор, который нажал кнопку.
-- После нажатия `Отклонить` комментарий тоже должен прийти отдельным сообщением от того же модератора.
-- Поддерживаются форматы времени `YYYY-MM-DD HH:MM`, `DD.MM.YYYY HH:MM`, `HH:MM` и ISO 8601.
-- Если отправлен только `HH:MM` и это время уже прошло по `MODERATION_TIMEZONE`, публикация переносится на следующий день.
-- Сообщение `/cancel` отменяет ожидание времени и возвращает draft в `pending_review`.
-- Сообщение `/cancel` в режиме отклонения отменяет ввод комментария и возвращает draft в `pending_review`.
-- Комментарии отклонения сохраняются в SQLite и доступны через HTTP API.
-- Для автоправки на следующем старте комментарий может содержать инструкции:
-  - `title: Новый заголовок`
-  - `replace: старый текст => новый текст`
-  - `delete: фрагмент`
-  - `append: новый абзац`
-  - `prepend: вводный абзац`
-- Если немедленная публикация в канал завершилась ошибкой, draft не переводится в `failed`: модератор может повторить действие с того же control message.
-- Scheduler автоматически ретраит отложенные публикации по настройкам `SCHEDULER_RETRY_DELAY_SECONDS` и `SCHEDULER_MAX_ATTEMPTS`.
+Внутренний технический статус ожидания комментария к отклонению остается только внутри moderation flow и не является внешним article-status.
 
 ## API
 
-### `GET /health`
+### Основной flow
 
-Проверка, что сервер поднялся и прочитал конфигурацию обоих ботов.
+#### `POST /articles/dry-run`
 
-### `POST /drafts`
+Primary preflight endpoint.
 
-Основной endpoint. Создает moderation draft, отправляет статью в review-группу и публикует control message с кнопками.
+- если `article_id` отсутствует, сервер создает новый article record и возвращает `article_id`
+- если `article_id` уже есть, сервер обновляет snapshot той же статьи
+- moderation flow не запускается
+- в БД сохраняются markdown snapshot, payload snapshot и метаданные статьи
 
 ```bash
-curl -X POST http://localhost:8000/drafts \
+curl -X POST http://localhost:8000/articles/dry-run \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer replace_with_long_random_token" \
   -d '{
-    "text": "<b>Новая статья</b>\n\nЭто черновик для review.",
-    "parse_mode": "HTML",
-    "link_style": "buttons",
-    "links": [
-      {
-        "title": "Спецификация",
-        "url": "https://example.com/spec"
-      }
-    ],
-    "images": [
-      {
-        "url": "https://example.com/preview.png"
-      }
-    ]
+    "title": "Новая статья",
+    "slug": "new-article",
+    "markdown": "# Новая статья\n\nТекст статьи.\n",
+    "cover_path": "publications/InComedy/post-assets/new-article-cover.png",
+    "payload_path": ".codex-local/payloads/new-article.json",
+    "payload": {
+      "text": "<b>Новая статья</b>\n\nКороткий Telegram-пост.",
+      "parse_mode": "HTML",
+      "link_style": "buttons"
+    }
   }'
 ```
 
-После этого moderation bot:
-- отправит саму статью в `MODERATION_CHAT_ID`
-- отдельным сообщением покажет статус черновика и кнопки
-- по кнопке `Запланировать` попросит прислать время отдельным сообщением
+#### `POST /articles/submit`
 
-Поддерживаемые форматы времени в чате:
-- `2026-03-23 10:30`
-- `23.03.2026 10:30`
-- `10:30`
-- `2026-03-23T10:30:00+03:00`
+Штатная отправка статьи в moderation flow.
 
-Если указать только `10:30`, сервис интерпретирует время в `MODERATION_TIMEZONE`, а если оно уже прошло сегодня, перенесет публикацию на завтра.
+- принимает тот же article snapshot
+- использует существующий `article_id` или создаст его при совместимом fallback-сценарии
+- создает moderation draft, связанный с `article_id`
+- отправляет preview в review-группу и control message
 
-Отменить режим ввода времени можно сообщением `/cancel`. Время должно прийти отдельным сообщением от того же модератора, который нажал `Запланировать`.
+#### `GET /articles`
 
-### `GET /drafts`
+Список server-side article records. Это article-centric snapshot-слой в SQLite, а не сканирование локального диска.
 
-Список черновиков. Можно фильтровать по `?status=pending_review`.
+#### `GET /articles/{article_id}`
 
-### `GET /drafts/{id}`
+Детали статьи по стабильному `article_id`.
 
-Детали одного moderation draft.
-
-### `GET /drafts/{id}/comments`
-
-Комментарии модератора по конкретному draft-у.
-
-### `GET /articles`
-
-Список статей, которые сервис обнаружил в `ARTICLES_ROOT_PATH`.
-
-### `GET /articles/{id}`
-
-Детали одной статьи и ее текущий lifecycle-статус.
-
-### `GET /articles/{id}/comments`
+#### `GET /articles/{article_id}/comments`
 
 Комментарии модератора по статье.
 
-### `POST /publish`
+### Вспомогательные endpoints
 
-Прямой publish в канал через publisher bot. Это обход moderation flow.
+- `GET /drafts`
+- `GET /drafts/{draft_id}`
+- `GET /drafts/{draft_id}/comments`
 
-### `POST /schedule`
+`draft` теперь является попыткой модерации, а не primary identity статьи.
 
-Прямое создание отложенной публикации в канал. Это тоже bypass-сценарий.
+### Bypass endpoints
 
-### `GET /schedule`
-
-Список отложенных задач.
-
-### `GET /schedule/{id}`
-
-Детали одной отложенной публикации.
-
-### `DELETE /schedule/{id}`
-
-Отмена задачи в статусе `pending` или `failed`.
+- `POST /publish` — прямой publish и dry run для технических сценариев
+- `POST /schedule` — прямое создание scheduled post
+- `GET /schedule`
+- `GET /schedule/{id}`
+- `DELETE /schedule/{id}`
 
 ## Поведение сервиса
 
 - moderation flow использует два разных bot token в одном процессе
 - preview в review-группе уходит через moderation bot
 - публикация в канал уходит через publisher bot
-- длинные plain-text статьи публикуются в Telegram несколькими сообщениями
-- если в группе выбрано время, scheduler публикует пост позже автоматически
-- scheduler обновляет статус draft-а после фактической публикации
-- lifecycle статьи синхронизируется со статусом связанного moderation draft-а
-- при отклонении комментарий сохраняется отдельно от draft-а и не теряется между перезапусками
-- при ошибке немедленной публикации control message остается активным, чтобы можно было повторить действие
-- если картинок нет, используется `sendMessage`
-- если картинка одна, используется `sendPhoto`
-- если картинок несколько, используется `sendMediaGroup`
-- если caption не влезает, сервис отправит картинки и отдельное сообщение с текстом
+- scheduler обновляет статус article record после фактической публикации
+- reject сохраняет `moderation_comment` и переводит статью в `rejected`
+- confirm публикует snapshot статьи из БД и переводит статью в `published`
+- schedule сохраняет `scheduled_publish_at`, публикует позже из БД и переживает рестарт
+
+## Переменные окружения
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHANNEL_ID`
+- `MODERATION_BOT_TOKEN`
+- `MODERATION_CHAT_ID`
+- `MODERATION_TIMEZONE`
+- `MODERATION_ALLOWED_USER_IDS`
+- `MODERATION_POLL_INTERVAL_SECONDS`
+- `MODERATION_POLL_TIMEOUT_SECONDS`
+- `PUBLISH_API_TOKEN`
+- `TELEGRAM_API_BASE`
+- `REQUEST_TIMEOUT_SECONDS`
+- `DEFAULT_PARSE_MODE`
+- `DEFAULT_LINK_STYLE`
+- `SCHEDULER_DB_PATH`
+- `SCHEDULER_POLL_INTERVAL_SECONDS`
+- `SCHEDULER_BATCH_SIZE`
+- `SCHEDULER_RETRY_DELAY_SECONDS`
+- `SCHEDULER_MAX_ATTEMPTS`
+
+`ARTICLES_ROOT_PATH` и `ARTICLES_AUTO_SYNC_ON_STARTUP` больше не используются.
 
 ## Документация
 
 - [Правила публикации](docs/publication-rules.md)
-- [Спецификация](docs/spec.md)
 - [Сервер и API](docs/server.md)
-- [Деплой и GitHub Actions](docs/deployment.md)
 - [Публикация из другого чата](docs/publishing-from-chat.md)
+- [Деплой и GitHub Actions](docs/deployment.md)
+- [Спецификация](docs/spec.md)

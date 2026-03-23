@@ -5,11 +5,7 @@ from secrets import compare_digest
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 
-from telegram_content_agent.articles import (
-    ArticleLifecycleService,
-    ArticleNotFoundError,
-    ArticleStore,
-)
+from telegram_content_agent.articles import ArticleNotFoundError, ArticleStore
 from telegram_content_agent.config import get_settings
 from telegram_content_agent.moderation import (
     ModerationBotRunner,
@@ -19,10 +15,13 @@ from telegram_content_agent.moderation import (
 )
 from telegram_content_agent.models import (
     ArticleCommentResponse,
+    ArticleDryRunResponse,
     ArticleResponse,
+    ArticleSnapshotRequest,
     ArticleStatus,
-    ModerationDraftStatus,
+    ArticleSubmitResponse,
     ModerationDraftResponse,
+    ModerationDraftStatus,
     PublishRequest,
     PublishResponse,
     SchedulePublishRequest,
@@ -52,14 +51,14 @@ async def lifespan(app: FastAPI):
         bot_token=settings.moderation_bot_token,
         default_chat_id=settings.moderation_chat_id,
     )
-    store = ScheduledPostStore(settings.scheduler_db_path)
+    scheduler_store = ScheduledPostStore(settings.scheduler_db_path)
     moderation_store = ModerationStore(settings.scheduler_db_path)
     article_store = ArticleStore(settings.scheduler_db_path)
-    store.initialize()
+    scheduler_store.initialize()
     moderation_store.initialize()
     article_store.initialize()
-    store.recover_processing_posts()
-    scheduler = ScheduledPublisher(settings=settings, publisher=publisher, store=store)
+    scheduler_store.recover_processing_posts()
+    scheduler = ScheduledPublisher(settings=settings, publisher=publisher, store=scheduler_store)
     moderation_service = ModerationService(
         settings=settings,
         store=moderation_store,
@@ -67,11 +66,6 @@ async def lifespan(app: FastAPI):
         moderation_publisher=moderation_publisher,
         channel_publisher=publisher,
         scheduler=scheduler,
-    )
-    article_service = ArticleLifecycleService(
-        settings=settings,
-        store=article_store,
-        submit_article_draft=moderation_service.submit_article_draft,
     )
     scheduler.set_event_handlers(
         on_post_published=moderation_service.sync_scheduled_post,
@@ -84,7 +78,6 @@ async def lifespan(app: FastAPI):
     )
     await scheduler.start()
     await moderation_runner.start()
-    await article_service.sync_on_startup()
     app.state.publisher = publisher
     app.state.moderation_publisher = moderation_publisher
     app.state.scheduler = scheduler
@@ -92,7 +85,6 @@ async def lifespan(app: FastAPI):
     app.state.article_store = article_store
     app.state.moderation_service = moderation_service
     app.state.moderation_runner = moderation_runner
-    app.state.article_service = article_service
     app.state.settings = settings
     try:
         yield
@@ -106,10 +98,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Telegram Content Agent",
     description=(
-        "HTTP server for Telegram article moderation and publication "
+        "HTTP server for article-centric Telegram moderation and publication "
         "with separate review and channel bots."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -153,6 +145,55 @@ async def publish(
     except TelegramPublishError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return PublishResponse(**result)
+
+
+@app.post("/articles/dry-run", response_model=ArticleDryRunResponse)
+async def article_dry_run(
+    request: ArticleSnapshotRequest,
+    _: None = Depends(verify_publish_token),
+) -> ArticleDryRunResponse:
+    publisher: TelegramPublisher = app.state.publisher
+    article_store: ArticleStore = app.state.article_store
+    try:
+        dry_run_result = await publisher.publish(
+            request.payload.model_copy(update={"dry_run": True, "chat_id": None})
+        )
+    except TelegramPublishError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    article = article_store.upsert_snapshot(
+        request,
+        status="draft",
+        publish_strategy=dry_run_result["strategy"],
+        last_error=None,
+    )
+    return ArticleDryRunResponse(
+        article=article.to_response(),
+        dry_run=PublishResponse(**dry_run_result),
+    )
+
+
+@app.post("/articles/submit", response_model=ArticleSubmitResponse)
+async def submit_article(
+    request: ArticleSnapshotRequest,
+    _: None = Depends(verify_publish_token),
+) -> ArticleSubmitResponse:
+    article_store: ArticleStore = app.state.article_store
+    moderation_service: ModerationService = app.state.moderation_service
+    article = article_store.upsert_snapshot(
+        request,
+        status="draft",
+        publish_strategy=request.publish_strategy,
+        last_error=None,
+    )
+    try:
+        draft = await moderation_service.submit_article(
+            article_id=article.article_id,
+            request=article.payload,
+        )
+    except TelegramPublishError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    refreshed_article = article_store.get(article.article_id)
+    return ArticleSubmitResponse(article=refreshed_article, draft=draft)
 
 
 @app.post("/drafts", response_model=ModerationDraftResponse)

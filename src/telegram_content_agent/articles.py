@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import hashlib
-import re
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any
 from uuid import uuid4
 
-from telegram_content_agent.config import Settings
 from telegram_content_agent.models import (
     ArticleCommentResponse,
     ArticleResponse,
+    ArticleSnapshotRequest,
     PublishRequest,
 )
 
@@ -23,35 +22,47 @@ class ArticleNotFoundError(RuntimeError):
 
 @dataclass(slots=True)
 class ArticleRecord:
-    id: str
-    source_path: Path
-    publication: str
-    slug: str
-    title: str
+    article_id: str
     status: str
     created_at: datetime
     updated_at: datetime
-    current_source_hash: str
-    last_submitted_hash: str | None
-    current_draft_id: str | None
+    scheduled_publish_at: datetime | None
     published_at: datetime | None
+    moderation_comment: str | None
+    title: str
+    slug: str
+    cover_path: str | None
+    payload_path: str | None
+    source_refs: list[str]
+    attached_links: list[str]
+    last_synced_at: datetime | None
+    publish_strategy: str | None
     last_error: str | None
+    markdown: str
+    payload: PublishRequest
+    current_draft_id: str | None
 
     def to_response(self) -> ArticleResponse:
         return ArticleResponse(
-            id=self.id,
-            source_path=self.source_path,
-            publication=self.publication,
-            slug=self.slug,
-            title=self.title,
+            article_id=self.article_id,
             status=self.status,
             created_at=self.created_at,
             updated_at=self.updated_at,
-            current_source_hash=self.current_source_hash,
-            last_submitted_hash=self.last_submitted_hash,
-            current_draft_id=self.current_draft_id,
+            scheduled_publish_at=self.scheduled_publish_at,
             published_at=self.published_at,
+            moderation_comment=self.moderation_comment,
+            title=self.title,
+            slug=self.slug,
+            cover_path=self.cover_path,
+            payload_path=self.payload_path,
+            source_refs=self.source_refs,
+            attached_links=self.attached_links,
+            last_synced_at=self.last_synced_at,
+            publish_strategy=self.publish_strategy,
             last_error=self.last_error,
+            markdown=self.markdown,
+            payload=self.payload,
+            current_draft_id=self.current_draft_id,
         )
 
 
@@ -77,18 +88,6 @@ class ArticleCommentRecord:
         )
 
 
-@dataclass(slots=True)
-class ArticleSource:
-    id: str
-    path: Path
-    publication: str
-    slug: str
-    title: str
-    markdown_text: str
-    rendered_text: str
-    content_hash: str
-
-
 class ArticleStore:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = Path(db_path).expanduser()
@@ -100,21 +99,33 @@ class ArticleStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS articles (
-                    id TEXT PRIMARY KEY,
-                    source_path TEXT NOT NULL UNIQUE,
-                    publication TEXT NOT NULL,
-                    slug TEXT NOT NULL,
-                    title TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS article_records (
+                    article_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    current_source_hash TEXT NOT NULL,
-                    last_submitted_hash TEXT,
-                    current_draft_id TEXT,
+                    scheduled_publish_at TEXT,
                     published_at TEXT,
-                    last_error TEXT
+                    moderation_comment TEXT,
+                    title TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    cover_path TEXT,
+                    payload_path TEXT,
+                    source_refs_json TEXT NOT NULL,
+                    attached_links_json TEXT NOT NULL,
+                    last_synced_at TEXT,
+                    publish_strategy TEXT,
+                    last_error TEXT,
+                    markdown TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    current_draft_id TEXT
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_article_records_status_updated
+                ON article_records(status, updated_at DESC)
                 """
             )
             connection.execute(
@@ -142,117 +153,157 @@ class ArticleStore:
                 ON article_comments(draft_id, created_at DESC)
                 """
             )
+            self._backfill_legacy_articles(connection)
             connection.commit()
 
-    def upsert_source(self, source: ArticleSource) -> ArticleRecord:
-        now = self._iso(datetime.now(UTC))
-        with self._connect() as connection:
-            existing = connection.execute(
-                "SELECT id FROM articles WHERE id = ?",
-                (source.id,),
-            ).fetchone()
-            payload = (
-                str(source.path),
-                source.publication,
-                source.slug,
-                source.title,
-                source.content_hash,
-                now,
-                source.id,
-            )
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO articles (
-                        id, source_path, publication, slug, title, status,
-                        created_at, updated_at, current_source_hash, last_submitted_hash,
-                        current_draft_id, published_at, last_error
-                    ) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, NULL, NULL, NULL, NULL)
-                    """,
-                    (
-                        source.id,
-                        str(source.path),
-                        source.publication,
-                        source.slug,
-                        source.title,
-                        now,
-                        now,
-                        source.content_hash,
-                    ),
-                )
-            else:
-                connection.execute(
-                    """
-                    UPDATE articles
-                    SET source_path = ?,
-                        publication = ?,
-                        slug = ?,
-                        title = ?,
-                        current_source_hash = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    payload,
-                )
-            connection.commit()
-        return self.get_record(source.id)
-
-    def attach_draft(
+    def upsert_snapshot(
         self,
-        article_id: str,
+        snapshot: ArticleSnapshotRequest,
         *,
-        draft_id: str,
-        source_hash: str,
-        status: str,
+        status: str | None = None,
+        publish_strategy: str | None = None,
+        last_error: str | None = None,
     ) -> ArticleRecord:
+        now = datetime.now(UTC)
+        article_id = snapshot.article_id or uuid4().hex
+        existing = self._get_optional(connection=None, article_id=article_id)
+        created_at = snapshot.created_at or (existing.created_at if existing else now)
+        updated_at = snapshot.updated_at or now
+        record_status = self._normalize_article_status(
+            status or (existing.status if existing else "draft")
+        )
+        request = self._sanitize_payload(snapshot.payload)
+        row = {
+            "article_id": article_id,
+            "status": record_status,
+            "created_at": self._iso(created_at),
+            "updated_at": self._iso(updated_at),
+            "scheduled_publish_at": self._iso(snapshot.scheduled_publish_at)
+            if snapshot.scheduled_publish_at is not None
+            else (self._iso(existing.scheduled_publish_at) if existing and existing.scheduled_publish_at else None),
+            "published_at": self._iso(existing.published_at) if existing and existing.published_at else None,
+            "moderation_comment": snapshot.moderation_comment
+            if snapshot.moderation_comment is not None
+            else (existing.moderation_comment if existing else None),
+            "title": snapshot.title,
+            "slug": snapshot.slug,
+            "cover_path": snapshot.cover_path,
+            "payload_path": snapshot.payload_path,
+            "source_refs_json": json.dumps(snapshot.source_refs, ensure_ascii=False),
+            "attached_links_json": json.dumps(snapshot.attached_links, ensure_ascii=False),
+            "last_synced_at": self._iso(snapshot.last_synced_at)
+            if snapshot.last_synced_at is not None
+            else self._iso(now),
+            "publish_strategy": publish_strategy
+            or snapshot.publish_strategy
+            or (existing.publish_strategy if existing else None),
+            "last_error": last_error,
+            "markdown": snapshot.markdown,
+            "payload_json": request.model_dump_json(),
+            "current_draft_id": existing.current_draft_id if existing else None,
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO article_records (
+                    article_id, status, created_at, updated_at, scheduled_publish_at,
+                    published_at, moderation_comment, title, slug, cover_path, payload_path,
+                    source_refs_json, attached_links_json, last_synced_at, publish_strategy,
+                    last_error, markdown, payload_json, current_draft_id
+                ) VALUES (
+                    :article_id, :status, :created_at, :updated_at, :scheduled_publish_at,
+                    :published_at, :moderation_comment, :title, :slug, :cover_path, :payload_path,
+                    :source_refs_json, :attached_links_json, :last_synced_at, :publish_strategy,
+                    :last_error, :markdown, :payload_json, :current_draft_id
+                )
+                ON CONFLICT(article_id) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = excluded.updated_at,
+                    scheduled_publish_at = excluded.scheduled_publish_at,
+                    moderation_comment = excluded.moderation_comment,
+                    title = excluded.title,
+                    slug = excluded.slug,
+                    cover_path = excluded.cover_path,
+                    payload_path = excluded.payload_path,
+                    source_refs_json = excluded.source_refs_json,
+                    attached_links_json = excluded.attached_links_json,
+                    last_synced_at = excluded.last_synced_at,
+                    publish_strategy = excluded.publish_strategy,
+                    last_error = excluded.last_error,
+                    markdown = excluded.markdown,
+                    payload_json = excluded.payload_json
+                """,
+                row,
+            )
+            connection.commit()
+        return self.get_record(article_id)
+
+    def attach_draft(self, article_id: str, *, draft_id: str, status: str) -> ArticleRecord:
         return self._update_article(
             article_id,
             """
-            UPDATE articles
+            UPDATE article_records
             SET current_draft_id = ?,
-                last_submitted_hash = ?,
                 status = ?,
                 updated_at = ?,
                 last_error = NULL
-            WHERE id = ?
+            WHERE article_id = ?
             """,
-            (draft_id, source_hash, status, self._iso(datetime.now(UTC)), article_id),
+            (
+                draft_id,
+                self._normalize_article_status(status),
+                self._iso(datetime.now(UTC)),
+                article_id,
+            ),
         )
 
-    def sync_status(
+    def sync_state(
         self,
         article_id: str,
         *,
         status: str,
+        scheduled_publish_at: datetime | None = None,
         published_at: datetime | None = None,
+        moderation_comment: str | None = None,
         last_error: str | None = None,
+        publish_strategy: str | None = None,
     ) -> ArticleRecord:
+        existing = self.get_record(article_id)
+        normalized_status = self._normalize_article_status(status)
         return self._update_article(
             article_id,
             """
-            UPDATE articles
+            UPDATE article_records
             SET status = ?,
                 updated_at = ?,
-                published_at = COALESCE(?, published_at),
-                last_error = ?
-            WHERE id = ?
+                scheduled_publish_at = ?,
+                published_at = ?,
+                moderation_comment = ?,
+                last_error = ?,
+                publish_strategy = ?,
+                current_draft_id = CASE WHEN ? = 'draft' THEN NULL ELSE current_draft_id END
+            WHERE article_id = ?
             """,
             (
-                status,
+                normalized_status,
                 self._iso(datetime.now(UTC)),
-                self._iso(published_at) if published_at is not None else None,
+                self._iso(scheduled_publish_at) if scheduled_publish_at is not None else None,
+                self._iso(published_at) if published_at is not None else existing.published_at and self._iso(existing.published_at),
+                moderation_comment if moderation_comment is not None else existing.moderation_comment,
                 last_error,
+                publish_strategy if publish_strategy is not None else existing.publish_strategy,
+                normalized_status,
                 article_id,
             ),
         )
 
     def list(self, *, status: str | None = None) -> list[ArticleResponse]:
-        query = "SELECT * FROM articles"
+        query = "SELECT * FROM article_records"
         params: tuple[str, ...] = ()
         if status is not None:
             query += " WHERE status = ?"
-            params = (status,)
-        query += " ORDER BY created_at DESC"
+            params = (self._normalize_article_status(status),)
+        query += " ORDER BY updated_at DESC, created_at DESC"
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [self._row_to_article(row).to_response() for row in rows]
@@ -261,14 +312,13 @@ class ArticleStore:
         return self.get_record(article_id).to_response()
 
     def get_record(self, article_id: str) -> ArticleRecord:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM articles WHERE id = ?",
-                (article_id,),
-            ).fetchone()
-        if row is None:
+        record = self._get_optional(connection=None, article_id=article_id)
+        if record is None:
             raise ArticleNotFoundError(f"Article not found: {article_id}")
-        return self._row_to_article(row)
+        return record
+
+    def get_publish_request(self, article_id: str) -> PublishRequest:
+        return self.get_record(article_id).payload
 
     def create_comment(
         self,
@@ -359,15 +409,19 @@ class ArticleStore:
         return self._row_to_comment(row)
 
     def mark_comment_applied(self, comment_id: str) -> ArticleCommentRecord:
-        return self._update_comment(
-            comment_id,
-            """
-            UPDATE article_comments
-            SET applied_at = ?
-            WHERE id = ?
-            """,
-            (self._iso(datetime.now(UTC)), comment_id),
-        )
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE article_comments
+                SET applied_at = ?
+                WHERE id = ?
+                """,
+                (self._iso(datetime.now(UTC)), comment_id),
+            )
+            if updated.rowcount == 0:
+                raise ArticleNotFoundError(f"Comment not found: {comment_id}")
+            connection.commit()
+        return self.get_comment(comment_id)
 
     def count_draft_attempts(self, article_id: str) -> int:
         with self._connect() as connection:
@@ -378,6 +432,87 @@ class ArticleStore:
         if row is None:
             return 0
         return int(row["total"])
+
+    def _backfill_legacy_articles(self, connection: sqlite3.Connection) -> None:
+        record_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM article_records"
+        ).fetchone()["total"]
+        if record_count:
+            return
+
+        legacy_articles_exists = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'articles'
+            """
+        ).fetchone()
+        if not legacy_articles_exists:
+            return
+
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(articles)").fetchall()
+        }
+        if "source_path" not in columns:
+            return
+
+        legacy_rows = connection.execute("SELECT * FROM articles ORDER BY created_at ASC").fetchall()
+        for row in legacy_rows:
+            draft_payload = self._load_latest_legacy_payload(connection, row["id"])
+            payload = (
+                PublishRequest.model_validate_json(draft_payload)
+                if draft_payload
+                else PublishRequest(text=row["title"], dry_run=False)
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO article_records (
+                    article_id, status, created_at, updated_at, scheduled_publish_at,
+                    published_at, moderation_comment, title, slug, cover_path, payload_path,
+                    source_refs_json, attached_links_json, last_synced_at, publish_strategy,
+                    last_error, markdown, payload_json, current_draft_id
+                ) VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?, NULL, NULL, '[]', '[]', NULL, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    self._normalize_article_status(row["status"]),
+                    row["created_at"],
+                    row["updated_at"],
+                    row["published_at"],
+                    row["title"],
+                    row["slug"],
+                    row["last_error"],
+                    "",
+                    payload.model_dump_json(),
+                    row["current_draft_id"],
+                ),
+            )
+
+    @staticmethod
+    def _load_latest_legacy_payload(connection: sqlite3.Connection, article_id: str) -> str | None:
+        table_exists = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'moderation_drafts'
+            """
+        ).fetchone()
+        if not table_exists:
+            return None
+        row = connection.execute(
+            """
+            SELECT request_json
+            FROM moderation_drafts
+            WHERE article_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (article_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["request_json"]
 
     def _update_article(
         self,
@@ -392,18 +527,26 @@ class ArticleStore:
             connection.commit()
         return self.get_record(article_id)
 
-    def _update_comment(
+    def _get_optional(
         self,
-        comment_id: str,
-        statement: str,
-        params: tuple[object, ...],
-    ) -> ArticleCommentRecord:
-        with self._connect() as connection:
-            updated = connection.execute(statement, params)
-            if updated.rowcount == 0:
-                raise ArticleNotFoundError(f"Comment not found: {comment_id}")
-            connection.commit()
-        return self.get_comment(comment_id)
+        *,
+        connection: sqlite3.Connection | None,
+        article_id: str,
+    ) -> ArticleRecord | None:
+        if connection is None:
+            with self._connect() as local_connection:
+                row = local_connection.execute(
+                    "SELECT * FROM article_records WHERE article_id = ?",
+                    (article_id,),
+                ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM article_records WHERE article_id = ?",
+                (article_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_article(row)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._db_path)
@@ -412,19 +555,25 @@ class ArticleStore:
 
     def _row_to_article(self, row: sqlite3.Row) -> ArticleRecord:
         return ArticleRecord(
-            id=row["id"],
-            source_path=Path(row["source_path"]),
-            publication=row["publication"],
-            slug=row["slug"],
-            title=row["title"],
-            status=row["status"],
+            article_id=row["article_id"],
+            status=self._normalize_article_status(row["status"]),
             created_at=self._parse_datetime(row["created_at"]),
             updated_at=self._parse_datetime(row["updated_at"]),
-            current_source_hash=row["current_source_hash"],
-            last_submitted_hash=row["last_submitted_hash"],
-            current_draft_id=row["current_draft_id"],
+            scheduled_publish_at=self._parse_optional_datetime(row["scheduled_publish_at"]),
             published_at=self._parse_optional_datetime(row["published_at"]),
+            moderation_comment=row["moderation_comment"],
+            title=row["title"],
+            slug=row["slug"],
+            cover_path=row["cover_path"],
+            payload_path=row["payload_path"],
+            source_refs=list(json.loads(row["source_refs_json"] or "[]")),
+            attached_links=list(json.loads(row["attached_links_json"] or "[]")),
+            last_synced_at=self._parse_optional_datetime(row["last_synced_at"]),
+            publish_strategy=row["publish_strategy"],
             last_error=row["last_error"],
+            markdown=row["markdown"],
+            payload=PublishRequest.model_validate_json(row["payload_json"]),
+            current_draft_id=row["current_draft_id"],
         )
 
     def _row_to_comment(self, row: sqlite3.Row) -> ArticleCommentRecord:
@@ -437,6 +586,16 @@ class ArticleStore:
             created_at=self._parse_datetime(row["created_at"]),
             applied_at=self._parse_optional_datetime(row["applied_at"]),
         )
+
+    @staticmethod
+    def _sanitize_payload(payload: PublishRequest) -> PublishRequest:
+        return payload.model_copy(update={"dry_run": False, "chat_id": None})
+
+    @staticmethod
+    def _normalize_article_status(status: str) -> str:
+        if status == "awaiting_rejection_comment":
+            return "pending_review"
+        return status
 
     @staticmethod
     def _iso(value: datetime) -> str:
@@ -453,225 +612,271 @@ class ArticleStore:
         return cls._parse_datetime(value)
 
 
-class ArticleDocumentParser:
-    _FRONT_MATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.DOTALL)
-    _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-    _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
-    _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-    _HEADING_RE = re.compile(r"^(#{1,6})\s+", re.MULTILINE)
-    _BOLD_RE = re.compile(r"(\*\*|__)(.*?)\1", re.DOTALL)
-    _ITALIC_RE = re.compile(r"(?<!\*)\*(?!\s)(.*?)(?<!\s)\*(?!\*)|_(?!\s)(.*?)(?<!\s)_", re.DOTALL)
-    _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
-    _MULTI_BLANK_RE = re.compile(r"\n{3,}")
+@dataclass(slots=True)
+class LocalArticleDocument:
+    article_id: str | None
+    status: str
+    created_at: datetime | None
+    updated_at: datetime | None
+    scheduled_publish_at: datetime | None
+    moderation_comment: str | None
+    title: str
+    slug: str
+    cover_path: str | None
+    payload_path: str | None
+    source_refs: list[str]
+    attached_links: list[str]
+    last_synced_at: datetime | None
+    publish_strategy: str | None
+    last_error: str | None
+    body: str
+    path: Path | None = None
 
-    def __init__(self, *, root_path: Path) -> None:
-        self._root_path = root_path.expanduser()
-        if not self._root_path.is_absolute():
-            self._root_path = self._root_path.resolve()
 
-    def scan(self) -> list[ArticleSource]:
-        if not self._root_path.exists():
-            return []
-        sources: list[ArticleSource] = []
-        for path in sorted(self._root_path.rglob("articles/*.md")):
-            if not path.is_file():
-                continue
-            sources.append(self.load(path))
-        return sources
+@dataclass(slots=True)
+class LocalArticleCard:
+    article_id: str | None
+    slug: str
+    status: str
+    path: str
+    updated_at: str | None
 
-    def load(self, path: Path) -> ArticleSource:
-        resolved_path = path.expanduser()
-        if not resolved_path.is_absolute():
-            resolved_path = resolved_path.resolve()
-        markdown_text = resolved_path.read_text(encoding="utf-8")
-        relative_path = resolved_path.relative_to(self._root_path)
-        publication = relative_path.parts[0] if len(relative_path.parts) > 1 else "default"
-        slug = resolved_path.stem
-        article_id = relative_path.with_suffix("").as_posix().replace("/", ":")
-        title = self._extract_title(markdown_text, fallback=slug.replace("-", " ").strip())
-        rendered_text = self._render_markdown(markdown_text, title=title)
-        content_hash = hashlib.sha256(markdown_text.encode("utf-8")).hexdigest()
-        return ArticleSource(
-            id=article_id,
-            path=resolved_path,
-            publication=publication,
-            slug=slug,
-            title=title,
-            markdown_text=markdown_text,
-            rendered_text=rendered_text,
-            content_hash=content_hash,
+
+class LocalArticleRepository:
+    def __init__(self, publication_root: Path) -> None:
+        self._publication_root = publication_root.expanduser()
+        if not self._publication_root.is_absolute():
+            self._publication_root = self._publication_root.resolve()
+        self._workspace_root = self._publication_root.parent.parent
+        self._articles_root = self._publication_root / "articles"
+        self._active_dir = self._articles_root / "active"
+        self._archive_dir = self._articles_root / "archive"
+        self._index_path = self._articles_root / "index.json"
+
+    @property
+    def active_dir(self) -> Path:
+        return self._active_dir
+
+    @property
+    def archive_dir(self) -> Path:
+        return self._archive_dir
+
+    @property
+    def index_path(self) -> Path:
+        return self._index_path
+
+    def initialize(self) -> None:
+        self._active_dir.mkdir(parents=True, exist_ok=True)
+        self._archive_dir.mkdir(parents=True, exist_ok=True)
+        if not self._index_path.exists():
+            self._write_index({"active": [], "archive": []})
+
+    def read_index(self) -> dict[str, list[dict[str, Any]]]:
+        self.initialize()
+        raw = json.loads(self._index_path.read_text(encoding="utf-8"))
+        return {
+            "active": list(raw.get("active", [])),
+            "archive": list(raw.get("archive", [])),
+        }
+
+    def load_article(self, path: Path) -> LocalArticleDocument:
+        content = path.read_text(encoding="utf-8")
+        if not content.startswith("---\n"):
+            raise ValueError(f"Markdown article does not have YAML front matter: {path}")
+        _, _, tail = content.partition("---\n")
+        front_matter, _, body = tail.partition("\n---\n")
+        metadata = self._parse_front_matter(front_matter)
+        return LocalArticleDocument(
+            article_id=metadata.get("article_id"),
+            status=metadata["status"],
+            created_at=self._parse_optional_front_matter_datetime(metadata.get("created_at")),
+            updated_at=self._parse_optional_front_matter_datetime(metadata.get("updated_at")),
+            scheduled_publish_at=self._parse_optional_front_matter_datetime(
+                metadata.get("scheduled_publish_at")
+            ),
+            moderation_comment=metadata.get("moderation_comment"),
+            title=metadata["title"],
+            slug=metadata["slug"],
+            cover_path=metadata.get("cover_path"),
+            payload_path=metadata.get("payload_path"),
+            source_refs=list(metadata.get("source_refs", [])),
+            attached_links=list(metadata.get("attached_links", [])),
+            last_synced_at=self._parse_optional_front_matter_datetime(
+                metadata.get("last_synced_at")
+            ),
+            publish_strategy=metadata.get("publish_strategy"),
+            last_error=metadata.get("last_error"),
+            body=body,
+            path=path,
         )
 
-    def build_publish_request(self, source: ArticleSource) -> PublishRequest:
-        return PublishRequest(
-            text=source.rendered_text,
-            parse_mode=None,
-            disable_web_page_preview=True,
+    def save_article(self, article: LocalArticleDocument, *, archive: bool = False) -> Path:
+        self.initialize()
+        target_dir = self._archive_dir if archive else self._active_dir
+        target_path = target_dir / f"{article.slug}.md"
+        target_path.write_text(self._render_article(article), encoding="utf-8")
+        self._update_index(article, target_path, archive=archive)
+        return target_path
+
+    def list_active_cards(self) -> list[LocalArticleCard]:
+        index = self.read_index()
+        return [self._card_from_dict(item) for item in index["active"]]
+
+    def archive_article(self, *, article_id: str | None = None, slug: str | None = None) -> Path:
+        if article_id is None and slug is None:
+            raise ValueError("archive_article requires article_id or slug.")
+        index = self.read_index()
+        match = None
+        for item in index["active"]:
+            if item.get("article_id") == article_id or item.get("slug") == slug:
+                match = item
+                break
+        if match is None:
+            raise FileNotFoundError("Active article not found in index.json.")
+        source_path = self._workspace_root / match["path"]
+        article = self.load_article(source_path)
+        target_path = self._archive_dir / source_path.name
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.replace(target_path)
+        article.path = target_path
+        self._update_index(article, target_path, archive=True)
+        return target_path
+
+    def _update_index(self, article: LocalArticleDocument, path: Path, *, archive: bool) -> None:
+        index = self.read_index()
+        relative_path = path.relative_to(self._workspace_root).as_posix()
+        card = {
+            "article_id": article.article_id,
+            "slug": article.slug,
+            "status": article.status,
+            "path": relative_path,
+            "updated_at": article.updated_at.astimezone(UTC).isoformat()
+            if article.updated_at is not None
+            else None,
+        }
+        active = [
+            item
+            for item in index["active"]
+            if item.get("path") != relative_path and item.get("slug") != article.slug
+        ]
+        archive_items = [
+            item
+            for item in index["archive"]
+            if item.get("path") != relative_path and item.get("slug") != article.slug
+        ]
+        if archive:
+            archive_items.insert(0, card)
+        else:
+            active.insert(0, card)
+        self._write_index({"active": active, "archive": archive_items})
+
+    def _write_index(self, payload: dict[str, list[dict[str, Any]]]) -> None:
+        self._index_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
 
-    def apply_comment_instructions(self, path: Path, comment: str) -> bool:
-        resolved_path = path.expanduser()
-        if not resolved_path.is_absolute():
-            resolved_path = resolved_path.resolve()
-        content = resolved_path.read_text(encoding="utf-8")
-        updated = content
-        changed = False
+    def _render_article(self, article: LocalArticleDocument) -> str:
+        metadata = {
+            "article_id": article.article_id,
+            "status": article.status,
+            "created_at": self._format_front_matter_datetime(article.created_at),
+            "updated_at": self._format_front_matter_datetime(article.updated_at),
+            "scheduled_publish_at": self._format_front_matter_datetime(article.scheduled_publish_at),
+            "moderation_comment": article.moderation_comment,
+            "title": article.title,
+            "slug": article.slug,
+            "cover_path": article.cover_path,
+            "payload_path": article.payload_path,
+            "source_refs": article.source_refs,
+            "attached_links": article.attached_links,
+            "last_synced_at": self._format_front_matter_datetime(article.last_synced_at),
+            "publish_strategy": article.publish_strategy,
+            "last_error": article.last_error,
+        }
+        front_matter = self._dump_front_matter(metadata)
+        body = article.body.lstrip("\n")
+        if not body.endswith("\n"):
+            body += "\n"
+        return f"---\n{front_matter}\n---\n{body}"
 
-        for raw_line in comment.splitlines():
-            line = raw_line.strip()
+    @classmethod
+    def _parse_front_matter(cls, front_matter: str) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        current_list_key: str | None = None
+        for raw_line in front_matter.splitlines():
+            line = raw_line.rstrip()
             if not line:
                 continue
-            key, _, value = line.partition(":")
-            if not value:
+            if line.startswith("  - "):
+                if current_list_key is None:
+                    raise ValueError("Invalid YAML front matter list item.")
+                result.setdefault(current_list_key, []).append(cls._parse_scalar(line[4:]))
                 continue
-            directive = key.strip().lower()
-            payload = self._decode_instruction_value(value.strip())
-            if directive == "title":
-                next_content = self._apply_title(updated, payload)
-            elif directive == "replace":
-                old_value, separator, new_value = payload.partition("=>")
-                if not separator:
-                    continue
-                next_content = updated.replace(
-                    old_value.strip(),
-                    new_value.strip(),
-                    1,
-                )
-            elif directive == "delete":
-                next_content = updated.replace(payload, "")
-            elif directive == "append":
-                suffix = payload if updated.endswith("\n") else f"\n\n{payload}"
-                next_content = f"{updated}{suffix}"
-            elif directive == "prepend":
-                next_content = f"{payload}\n\n{updated}"
-            else:
+            current_list_key = None
+            key, separator, raw_value = line.partition(":")
+            if not separator:
+                raise ValueError(f"Invalid YAML front matter line: {line}")
+            value = raw_value.strip()
+            if value == "":
+                result[key] = []
+                current_list_key = key
                 continue
-            if next_content != updated:
-                updated = next_content
-                changed = True
+            result[key] = cls._parse_scalar(value)
+        return result
 
-        if not changed:
+    @staticmethod
+    def _dump_front_matter(metadata: dict[str, Any]) -> str:
+        lines: list[str] = []
+        for key, value in metadata.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                for item in value:
+                    lines.append(f"  - {json.dumps(item, ensure_ascii=False)}")
+                continue
+            lines.append(f"{key}: {LocalArticleRepository._dump_scalar(value)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _dump_scalar(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _parse_scalar(value: str) -> Any:
+        if value == "null":
+            return None
+        if value == "true":
+            return True
+        if value == "false":
             return False
-        resolved_path.write_text(updated, encoding="utf-8")
-        return True
-
-    def _extract_title(self, markdown_text: str, *, fallback: str) -> str:
-        for raw_line in markdown_text.splitlines():
-            line = raw_line.strip()
-            if line.startswith("# "):
-                return line[2:].strip()
-        return fallback
-
-    def _render_markdown(self, markdown_text: str, *, title: str) -> str:
-        text = self._FRONT_MATTER_RE.sub("", markdown_text, count=1)
-        text = self._COMMENT_RE.sub("", text)
-        text = self._IMAGE_RE.sub(lambda match: match.group(1).strip(), text)
-        text = self._LINK_RE.sub(
-            lambda match: f"{match.group(1).strip()} ({match.group(2).strip()})",
-            text,
-        )
-        text = self._HEADING_RE.sub("", text)
-        text = self._BOLD_RE.sub(lambda match: match.group(2), text)
-        text = self._ITALIC_RE.sub(
-            lambda match: match.group(1) or match.group(2) or "",
-            text,
-        )
-        text = self._INLINE_CODE_RE.sub(lambda match: match.group(1), text)
-        text = text.replace("\r\n", "\n").strip()
-        if not text.startswith(title):
-            text = f"{title}\n\n{text}" if text else title
-        text = self._MULTI_BLANK_RE.sub("\n\n", text)
-        return text.strip()
+        if value.startswith('"') or value.startswith("[") or value.startswith("{"):
+            return json.loads(value)
+        return value
 
     @staticmethod
-    def _apply_title(markdown_text: str, title: str) -> str:
-        lines = markdown_text.splitlines()
-        for index, line in enumerate(lines):
-            if line.startswith("# "):
-                lines[index] = f"# {title}"
-                return "\n".join(lines)
-        return f"# {title}\n\n{markdown_text}".strip()
+    def _format_front_matter_datetime(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return value.astimezone(UTC).isoformat()
 
     @staticmethod
-    def _decode_instruction_value(value: str) -> str:
-        return value.replace("\\n", "\n").strip()
+    def _parse_optional_front_matter_datetime(value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value.astimezone(UTC)
+        return datetime.fromisoformat(str(value)).astimezone(UTC)
 
-
-class ArticleLifecycleService:
-    _ACTIVE_STATUSES = {
-        "pending_review",
-        "awaiting_schedule",
-        "awaiting_rejection_comment",
-        "scheduled",
-        "published",
-    }
-
-    def __init__(
-        self,
-        *,
-        settings: Settings,
-        store: ArticleStore,
-        submit_article_draft: Callable[[str, PublishRequest, str, int], Awaitable[None]],
-    ) -> None:
-        self._settings = settings
-        self._store = store
-        self._submit_article_draft = submit_article_draft
-        self._parser = ArticleDocumentParser(root_path=settings.articles_root_path)
-
-    async def sync_on_startup(self) -> None:
-        if not self._settings.articles_auto_sync_on_startup:
-            return
-        sources = self._parser.scan()
-        source_by_id = {source.id: source for source in sources}
-
-        for source in sources:
-            self._store.upsert_source(source)
-
-        for article_id, source in source_by_id.items():
-            record = self._store.get_record(article_id)
-            try:
-                await self._sync_article(record, source)
-            except Exception as error:
-                self._store.sync_status(
-                    article_id,
-                    status="failed",
-                    last_error=str(error),
-                )
-
-    async def _sync_article(self, record: ArticleRecord, source: ArticleSource) -> None:
-        if record.status in self._ACTIVE_STATUSES:
-            return
-
-        if record.status == "rejected":
-            comment = self._store.latest_comment(article_id=record.id, unapplied_only=True)
-            if record.last_submitted_hash != record.current_source_hash:
-                await self._submit_source(record, source, comment=comment)
-                return
-            if comment is not None and self._parser.apply_comment_instructions(source.path, comment.body):
-                refreshed_source = self._parser.load(source.path)
-                refreshed_record = self._store.upsert_source(refreshed_source)
-                await self._submit_source(refreshed_record, refreshed_source, comment=comment)
-            return
-
-        if record.status in {"draft", "failed"}:
-            should_submit = record.last_submitted_hash is None or record.status == "failed"
-            if should_submit:
-                await self._submit_source(record, source)
-
-    async def _submit_source(
-        self,
-        record: ArticleRecord,
-        source: ArticleSource,
-        *,
-        comment: ArticleCommentRecord | None = None,
-    ) -> None:
-        attempt = self._store.count_draft_attempts(record.id) + 1
-        request = self._parser.build_publish_request(source)
-        await self._submit_article_draft(
-            record.id,
-            request,
-            source.content_hash,
-            attempt,
+    @staticmethod
+    def _card_from_dict(item: dict[str, Any]) -> LocalArticleCard:
+        return LocalArticleCard(
+            article_id=item.get("article_id"),
+            slug=item["slug"],
+            status=item["status"],
+            path=item["path"],
+            updated_at=item.get("updated_at"),
         )
-        if comment is not None:
-            self._store.mark_comment_applied(comment.id)

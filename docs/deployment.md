@@ -9,6 +9,8 @@
 
 Webhook для moderation bot не нужен. Серверу достаточно исходящего доступа к Telegram API.
 
+Сервер не требует `ARTICLES_ROOT_PATH` и не сканирует локальные статьи на старте.
+
 ## Что уже есть в проекте
 
 - [`.github/workflows/ci.yml`](/Users/abetirov/projects/telegram-content-agent/.github/workflows/ci.yml)
@@ -107,8 +109,6 @@ SCHEDULER_POLL_INTERVAL_SECONDS=5
 SCHEDULER_BATCH_SIZE=10
 SCHEDULER_RETRY_DELAY_SECONDS=60
 SCHEDULER_MAX_ATTEMPTS=3
-ARTICLES_ROOT_PATH=/opt/telegram-content-agent/publications
-ARTICLES_AUTO_SYNC_ON_STARTUP=true
 ```
 
 Права на файл:
@@ -154,6 +154,7 @@ ls -l /opt/telegram-content-agent/data
 
 - `health` возвращает `channel_id` и `moderation_chat_id`
 - в `data/` появляется SQLite-файл runtime-состояния
+- в SQLite хранятся article-centric snapshot-ы и scheduled jobs
 - процесс стабильно держится как один `systemd`-service
 
 ## Важное по безопасности

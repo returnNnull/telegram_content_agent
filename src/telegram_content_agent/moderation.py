@@ -36,6 +36,7 @@ class ModerationDraftConflictError(RuntimeError):
 @dataclass(slots=True)
 class ModerationDraftRecord:
     id: str
+    article_id: str | None
     status: str
     created_at: datetime
     updated_at: datetime
@@ -48,13 +49,11 @@ class ModerationDraftRecord:
     publication_result: dict[str, Any] | None
     review_chat_id: str | None
     review_control_message_id: int | None
-    article_id: str | None
-    article_attempt: int | None
-    article_source_hash: str | None
 
     def to_response(self) -> ModerationDraftResponse:
         return ModerationDraftResponse(
             id=self.id,
+            article_id=self.article_id,
             status=self.status,
             created_at=self.created_at,
             updated_at=self.updated_at,
@@ -65,9 +64,6 @@ class ModerationDraftRecord:
             last_error=self.last_error,
             request=self.request,
             publication_result=self.publication_result,
-            article_id=self.article_id,
-            article_attempt=self.article_attempt,
-            article_source_hash=self.article_source_hash,
         )
 
 
@@ -84,6 +80,7 @@ class ModerationStore:
                 """
                 CREATE TABLE IF NOT EXISTS moderation_drafts (
                     id TEXT PRIMARY KEY,
+                    article_id TEXT,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -95,16 +92,10 @@ class ModerationStore:
                     request_json TEXT NOT NULL,
                     publication_result_json TEXT,
                     review_chat_id TEXT,
-                    review_control_message_id INTEGER,
-                    article_id TEXT,
-                    article_attempt INTEGER,
-                    article_source_hash TEXT
+                    review_control_message_id INTEGER
                 )
                 """
             )
-            self._ensure_column(connection, "moderation_drafts", "article_id", "TEXT")
-            self._ensure_column(connection, "moderation_drafts", "article_attempt", "INTEGER")
-            self._ensure_column(connection, "moderation_drafts", "article_source_hash", "TEXT")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pending_schedule_inputs (
@@ -127,6 +118,7 @@ class ModerationStore:
                 )
                 """
             )
+            self._ensure_column(connection, "moderation_drafts", "article_id", "TEXT")
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_moderation_drafts_scheduled_post_id
@@ -141,45 +133,25 @@ class ModerationStore:
         request: PublishRequest,
         *,
         article_id: str | None = None,
-        article_attempt: int | None = None,
-        article_source_hash: str | None = None,
     ) -> ModerationDraftRecord:
         now = datetime.now(UTC)
         draft_id = uuid4().hex
-        row = {
-            "id": draft_id,
-            "status": "pending_review",
-            "created_at": self._iso(now),
-            "updated_at": self._iso(now),
-            "published_at": None,
-            "rejected_at": None,
-            "scheduled_publish_at": None,
-            "scheduled_post_id": None,
-            "last_error": None,
-            "request_json": request.model_dump_json(),
-            "publication_result_json": None,
-            "review_chat_id": None,
-            "review_control_message_id": None,
-            "article_id": article_id,
-            "article_attempt": article_attempt,
-            "article_source_hash": article_source_hash,
-        }
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO moderation_drafts (
-                    id, status, created_at, updated_at, published_at, rejected_at,
+                    id, article_id, status, created_at, updated_at, published_at, rejected_at,
                     scheduled_publish_at, scheduled_post_id, last_error, request_json,
-                    publication_result_json, review_chat_id, review_control_message_id,
-                    article_id, article_attempt, article_source_hash
-                ) VALUES (
-                    :id, :status, :created_at, :updated_at, :published_at, :rejected_at,
-                    :scheduled_publish_at, :scheduled_post_id, :last_error, :request_json,
-                    :publication_result_json, :review_chat_id, :review_control_message_id,
-                    :article_id, :article_attempt, :article_source_hash
-                )
+                    publication_result_json, review_chat_id, review_control_message_id
+                ) VALUES (?, ?, 'pending_review', ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL)
                 """,
-                row,
+                (
+                    draft_id,
+                    article_id,
+                    self._iso(now),
+                    self._iso(now),
+                    request.model_dump_json(),
+                ),
             )
             connection.commit()
         return self.get_record(draft_id)
@@ -326,9 +298,7 @@ class ModerationStore:
             "awaiting_schedule",
             "awaiting_rejection_comment",
         }:
-            raise ModerationDraftConflictError(
-                "Only pending_review, awaiting_schedule or awaiting_rejection_comment drafts can be rejected."
-            )
+            raise ModerationDraftConflictError("Draft cannot be marked as rejected.")
         now = datetime.now(UTC)
         return self._update_record(
             draft_id,
@@ -542,6 +512,7 @@ class ModerationStore:
         publication_result = row["publication_result_json"]
         return ModerationDraftRecord(
             id=row["id"],
+            article_id=row["article_id"],
             status=row["status"],
             created_at=self._parse_datetime(row["created_at"]),
             updated_at=self._parse_datetime(row["updated_at"]),
@@ -554,9 +525,6 @@ class ModerationStore:
             publication_result=json.loads(publication_result) if publication_result else None,
             review_chat_id=row["review_chat_id"],
             review_control_message_id=row["review_control_message_id"],
-            article_id=row["article_id"],
-            article_attempt=row["article_attempt"],
-            article_source_hash=row["article_source_hash"],
         )
 
     @staticmethod
@@ -605,7 +573,7 @@ class ModerationService:
         *,
         settings: Settings,
         store: ModerationStore,
-        article_store: ArticleStore | None,
+        article_store: ArticleStore,
         moderation_publisher: TelegramPublisher,
         channel_publisher: TelegramPublisher,
         scheduler: ScheduledPublisher,
@@ -620,26 +588,18 @@ class ModerationService:
 
     async def submit_draft(self, request: SubmitDraftRequest) -> ModerationDraftResponse:
         sanitized_request = PublishRequest.model_validate(
-            request.model_dump(
-                exclude={"dry_run", "chat_id"},
-            )
+            request.model_dump(exclude={"dry_run", "chat_id"})
         )
         draft = await self._submit_internal(sanitized_request)
         return draft.to_response()
 
-    async def submit_article_draft(
+    async def submit_article(
         self,
+        *,
         article_id: str,
         request: PublishRequest,
-        source_hash: str,
-        article_attempt: int,
     ) -> ModerationDraftResponse:
-        draft = await self._submit_internal(
-            request,
-            article_id=article_id,
-            article_source_hash=source_hash,
-            article_attempt=article_attempt,
-        )
+        draft = await self._submit_internal(request, article_id=article_id)
         return draft.to_response()
 
     async def _submit_internal(
@@ -647,25 +607,14 @@ class ModerationService:
         request: PublishRequest,
         *,
         article_id: str | None = None,
-        article_source_hash: str | None = None,
-        article_attempt: int | None = None,
     ) -> ModerationDraftRecord:
-        draft = self._store.create_draft(
-            request,
-            article_id=article_id,
-            article_attempt=article_attempt,
-            article_source_hash=article_source_hash,
-        )
-        if self._article_store is not None and article_id is not None and article_source_hash is not None:
-            self._article_store.attach_draft(
-                article_id,
-                draft_id=draft.id,
-                source_hash=article_source_hash,
-                status=draft.status,
-            )
+        sanitized_request = request.model_copy(update={"dry_run": False, "chat_id": None})
+        draft = self._store.create_draft(sanitized_request, article_id=article_id)
+        if article_id is not None:
+            self._article_store.attach_draft(article_id, draft_id=draft.id, status=draft.status)
         try:
             await self._moderation_publisher.publish(
-                request.model_copy(
+                sanitized_request.model_copy(
                     update={
                         "dry_run": False,
                         "chat_id": self._settings.moderation_chat_id,
@@ -709,10 +658,7 @@ class ModerationService:
         if draft is None:
             return
         if post.status == "published":
-            draft = self._store.mark_published(
-                draft.id,
-                result=post.last_result,
-            )
+            draft = self._store.mark_published(draft.id, result=post.last_result)
         elif post.status == "failed":
             draft = self._store.mark_failed(
                 draft.id,
@@ -752,12 +698,6 @@ class ModerationService:
 
         parts = data.split(":", 2)
         if len(parts) != 3:
-            if callback_query_id:
-                await self._safe_answer_callback_query(
-                    callback_query_id,
-                    text="Некорректная команда.",
-                    show_alert=True,
-                )
             return
         _, action, draft_id = parts
 
@@ -902,13 +842,12 @@ class ModerationService:
 
         try:
             draft = self._store.get_record(rejection_draft_id)
-            if self._article_store is not None:
-                self._article_store.create_comment(
-                    draft_id=draft.id,
-                    article_id=draft.article_id,
-                    body=text,
-                    moderator_user_id=user_id,
-                )
+            self._article_store.create_comment(
+                draft_id=draft.id,
+                article_id=draft.article_id,
+                body=text,
+                moderator_user_id=user_id,
+            )
             self._store.clear_pending_rejection(chat_id=chat_id, user_id=user_id)
             self._store.clear_pending_rejection_for_draft(draft.id)
             draft = self._store.mark_rejected(draft.id)
@@ -916,7 +855,7 @@ class ModerationService:
             self._store.clear_pending_rejection(chat_id=chat_id, user_id=user_id)
             return
 
-        self._sync_article_status(draft)
+        self._sync_article_status(draft, moderation_comment=text)
         await self._refresh_control_message(draft)
         await self._moderation_publisher.send_message(
             chat_id=chat_id,
@@ -939,9 +878,14 @@ class ModerationService:
                 )
             return
 
+        request = (
+            self._article_store.get_publish_request(draft.article_id)
+            if draft.article_id is not None
+            else draft.request
+        )
         try:
             result = await self._channel_publisher.publish(
-                draft.request.model_copy(update={"dry_run": False, "chat_id": None})
+                request.model_copy(update={"dry_run": False, "chat_id": None})
             )
         except Exception as error:
             if callback_query_id:
@@ -1125,13 +1069,21 @@ class ModerationService:
         except TelegramPublishError:
             return
 
-    def _sync_article_status(self, draft: ModerationDraftRecord) -> None:
-        if self._article_store is None or draft.article_id is None:
+    def _sync_article_status(
+        self,
+        draft: ModerationDraftRecord,
+        *,
+        moderation_comment: str | None = None,
+    ) -> None:
+        if draft.article_id is None:
             return
-        self._article_store.sync_status(
+        status = "pending_review" if draft.status == "awaiting_rejection_comment" else draft.status
+        self._article_store.sync_state(
             draft.article_id,
-            status=draft.status,
+            status=status,
+            scheduled_publish_at=draft.scheduled_publish_at,
             published_at=draft.published_at if draft.status == "published" else None,
+            moderation_comment=moderation_comment,
             last_error=draft.last_error,
         )
 
@@ -1172,13 +1124,12 @@ class ModerationService:
                 f"<b>{escape(self._format_datetime(draft.rejected_at))}</b> "
                 f"({escape(self._settings.moderation_timezone)})"
             )
-        if self._article_store is not None:
-            latest_comment = self._article_store.latest_comment(draft_id=draft.id)
-            if latest_comment is not None:
-                lines.append(
-                    "Комментарий: "
-                    f"<code>{escape(self._short_error(latest_comment.body))}</code>"
-                )
+        latest_comment = self._article_store.latest_comment(draft_id=draft.id)
+        if latest_comment is not None:
+            lines.append(
+                "Комментарий: "
+                f"<code>{escape(self._short_error(latest_comment.body))}</code>"
+            )
         if draft.last_error:
             lines.append(f"Ошибка: <code>{escape(self._short_error(draft.last_error))}</code>")
         return "\n".join(lines)
@@ -1262,12 +1213,6 @@ class ModerationService:
         return (
             "Отправьте комментарий к отклонению одним сообщением.\n"
             "Комментарий будет сохранен в БД и доступен через API.\n\n"
-            "Если хотите автоматически править статью на старте, используйте инструкции в формате:\n"
-            "<code>title: Новый заголовок</code>\n"
-            "<code>replace: старый текст => новый текст</code>\n"
-            "<code>delete: фрагмент</code>\n"
-            "<code>append: новый абзац</code>\n"
-            "<code>prepend: вводный абзац</code>\n\n"
             "Чтобы выйти из режима отклонения, отправьте <code>/cancel</code>."
         )
 
@@ -1358,29 +1303,17 @@ class ModerationBotRunner:
                     timeout=self._settings.moderation_poll_timeout_seconds,
                     allowed_updates=["callback_query", "message"],
                 )
-            except Exception:
-                if await self._wait_or_stop():
-                    break
-                continue
-
-            for update in updates:
-                update_id = update.get("update_id")
-                if isinstance(update_id, int):
-                    self._offset = update_id + 1
-                try:
+                for update in updates:
+                    update_id = update.get("update_id")
+                    if isinstance(update_id, int):
+                        self._offset = update_id + 1
                     await self._moderation_service.handle_update(update)
-                except Exception:
-                    continue
-
-            if not updates and await self._wait_or_stop():
-                break
-
-    async def _wait_or_stop(self) -> bool:
-        try:
-            await asyncio.wait_for(
-                self._stop_event.wait(),
-                timeout=self._settings.moderation_poll_interval_seconds,
-            )
-        except TimeoutError:
-            return False
-        return True
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self._settings.moderation_poll_interval_seconds,
+                )
+            except TimeoutError:
+                continue
